@@ -1,6 +1,6 @@
 # gleam-to-c
 
-A [Gleam](https://gleam-lang.io/) → C compiler written in Rust. It parses a `.gleam` source file and emits a small C project (`main.c` plus an embedded C runtime) that compiles with any C11 compiler on a POSIX system.
+A [Gleam](https://gleam.run/) → C compiler written in Rust. It parses a `.gleam` source file and emits a small C project (`main.c` plus an embedded C runtime) that compiles with any C11 compiler on a POSIX system.
 
 No external crates — the whole project is `std`-only Rust plus two hand-written C files.
 
