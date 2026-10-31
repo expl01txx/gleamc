@@ -9,10 +9,11 @@ project is `std`-only Rust plus two hand-written C files.
 
 ```
 src/
-  lib.rs          crate root: re-exports parse, generate_c, write_c_project
+  lib.rs          crate root: re-exports parse, typecheck_source, generate_c, write_c_project
   lexer.rs        tokenizer (Token, TokenKind)
   ast.rs          AST types (Module, Definition, Expr, Pattern, ...)
   parser.rs       recursive-descent parser producing a Module
+  typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; also embeds the runtime via include_str!
   main.rs         CLI: `gleam-parser <file.gleam> -o <dir>`
   runtime/
@@ -20,7 +21,8 @@ src/
     gleam_runtime.c   runtime implementation + all stdlib function bodies
 tests/
   tour.rs         parser-level tests (no C involved)
-  runtime.rs      end-to-end tests: parse → codegen → cc → run → assert stdout
+  typecheck.rs    type checker tests: valid programs pass, invalid ones fail with a message
+  runtime.rs      end-to-end tests: parse → typecheck → codegen → cc → run → assert stdout
   hello.gleam     small demo program used by an e2e test
   string_test.gleam / int_test.gleam   stdlib test programs (see below)
 gleam_std_*.html  vendored stdlib docs (string, int, list, ...)
@@ -44,9 +46,13 @@ into the output directory. The generated `main.c` includes
 
 ### Pipeline
 
-`lexer.rs` → tokens → `parser.rs` → `Module` AST → `codegen.rs` → C source.
-`translate(source)` does parse+codegen in one call; `write_c_project` also
-writes the runtime files next to `main.c`.
+`lexer.rs` → tokens → `parser.rs` → `Module` AST → `typechecker.rs` →
+`codegen.rs` → C source.
+`translate(source)` does parse+typecheck+codegen in one call;
+`write_c_project` also type checks and writes the runtime files next to
+`main.c`. Type errors surface as `CompileError::Type` / `ProjectError::Type`
+wrapping a `TypeCheckError` (message + span, plus line/col when the source
+text is available via `typecheck_source`).
 
 ### Generated C model
 
@@ -63,6 +69,40 @@ for balancing retains/releases around temporaries.
   function).
 - Case clauses compile to sequential `if (!g_N_matched)` blocks; a
   non-exhaustive case ends in `g_panic("panic", ...)`.
+
+### Type checker structure (`src/typechecker.rs`)
+
+A Hindley–Milner inference engine over a single global substitution:
+
+- `Type`: `Var(u32)`, `App { module, name, args }`, `Fn(Vec<Type>, Box<Type>)`,
+  `Tuple(Vec<Type>)`, `BitArray { size, unit }`.
+- `Subst`: unification with occurrence checking; `apply` pushes the current
+  substitution through a type. Type variables are allocated from an ever-
+  increasing counter (`new_var`/`fresh`).
+- `Env`: module-level names — `types` (with params + alias/bare kind),
+  `constructors`, `functions` (generalized types + labels), `constants`,
+  `imports`, `unqualified_fns`, `unqualified_types`.
+- `Checker`: per-module state — the environment, the substitution, and a
+  stack of local scopes (`scopes`). Expression inference (`infer`) is
+  open-world: it returns a type with free variables. Patterns, guards,
+  operators, and calls add unification constraints.
+- **Generalization**: top-level functions are generalized over their free
+  variables after their body is checked (and re-instantiated on every lookup
+  via `instantiate`). `let` bindings and closures are *not* generalized —
+  they stay monomorphic, matching Gleam's let-polymorphism.
+- **Name resolution mirrors codegen**: locals shadow constants, constants
+  shadow functions; module-qualified names (`io.println`) resolve to the
+  native stdlib table only; record fields are looked up across all
+  constructors with the first match winning.
+- `std_function(sub, module, name) -> Option<(Type, Vec<Option<String>>)>`
+  is the Rust-side mirror of `codegen::std_function`: same modules,
+  functions, arities, and labels — but producing types instead of C names.
+  Opaque parameters (`io.debug`, `string.inspect`) get a fresh variable per
+  lookup. **When you add a stdlib function, update both tables.**
+- Built-in types registered in `Checker::new`: `Int`, `Float`, `Bool`,
+  `String`, `Nil`, `List`, `Option`, `Result`, `order/Order`,
+  `int/IntError`, `fs/Error` — with constructors `True`, `False`, `Ok`,
+  `Error`, `Some`, `None`, `Eq`, `Lt`, `Gt`, `InvalidBase`.
 
 ### Codegen structure (`src/codegen.rs`)
 
@@ -107,6 +147,10 @@ Worked example: `gleam/string` and `gleam/int` were added this way.
    - Add the module to `is_stdlib_module` so it works without an import.
    - Register any new custom-type constructors (e.g. `InvalidBase`) in the
      built-in constructor loop in `Compiler::new`.
+   - **Mirror the entry in `src/typechecker.rs::std_function`** with the same
+     arity and labels, producing a Gleam type (`t_fn(...)`). The two tables
+     must stay in sync or the type checker and codegen will disagree about
+     which programs are valid.
 
 4. **Declare** each function in `src/runtime/gleam_runtime.h`:
    `GValue gleam_<module>_<name>(GValue *args, size_t argc);`
@@ -178,6 +222,10 @@ Worked example: `gleam/string` and `gleam/int` were added this way.
 
 - **Parser tests** (`tests/tour.rs`): pure Rust, use the `ok(src)` /
   `err(src)` helpers; assert on AST shape. No C involved.
+- **Type checker tests** (`tests/typecheck.rs`): `ok(src)` asserts the module
+  type checks; `err(src, needle)` asserts it fails with a message containing
+  `needle`. Cover both positive programs (polymorphism, labels, guards,
+  closures, `use`) and rejections (arities, mismatches, unknown names).
 - **E2E tests** (`tests/runtime.rs`): `run_gleam(src, name)` parses, writes a
   project to `/tmp/gleam-parser-test-<name>`, compiles with
   `cc -std=c11 -Wall -Wextra`, runs, and returns stdout. Tests skip cleanly

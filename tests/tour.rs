@@ -1,8 +1,8 @@
 //! End-to-end tests for the Gleam parser, following the sections of the
 //! official Gleam language tour.
 
-use gleam_parser::ast::*;
-use gleam_parser::parse;
+use gleam_to_c::ast::*;
+use gleam_to_c::parse;
 
 /// Parse and assert success.
 fn ok(src: &str) -> Module {

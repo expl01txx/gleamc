@@ -5,6 +5,7 @@
 //! dependencies beyond a C11 compiler and the POSIX C library.
 
 use crate::ast::*;
+use crate::typechecker::{self, TypeCheckError};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -37,9 +38,10 @@ impl fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-/// Parse and translate one Gleam module to a C source file.
+/// Parse, type check and translate one Gleam module to a C source file.
 pub fn translate(source: &str) -> Result<String, CompileError> {
     let module = crate::parse(source).map_err(CompileError::Parse)?;
+    typechecker::typecheck_source(source, &module).map_err(CompileError::Type)?;
     generate_c(&module).map_err(CompileError::Codegen)
 }
 
@@ -49,8 +51,10 @@ pub fn generate_c(module: &Module) -> Result<String, CodegenError> {
     Compiler::new(module)?.compile()
 }
 
-/// Write `main.c`, `gleam_runtime.c`, and `gleam_runtime.h` into a directory.
+/// Type check the module, then write `main.c`, `gleam_runtime.c`, and
+/// `gleam_runtime.h` into a directory.
 pub fn write_c_project(module: &Module, directory: impl AsRef<Path>) -> Result<(), ProjectError> {
+    typechecker::typecheck(module).map_err(ProjectError::Type)?;
     let source = generate_c(module).map_err(ProjectError::Codegen)?;
     let directory = directory.as_ref();
     fs::create_dir_all(directory).map_err(ProjectError::Io)?;
@@ -63,6 +67,7 @@ pub fn write_c_project(module: &Module, directory: impl AsRef<Path>) -> Result<(
 #[derive(Debug)]
 pub enum CompileError {
     Parse(ParseError),
+    Type(TypeCheckError),
     Codegen(CodegenError),
 }
 
@@ -70,6 +75,7 @@ impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(error) => error.fmt(f),
+            Self::Type(error) => error.fmt(f),
             Self::Codegen(error) => error.fmt(f),
         }
     }
@@ -79,6 +85,7 @@ impl std::error::Error for CompileError {}
 
 #[derive(Debug)]
 pub enum ProjectError {
+    Type(TypeCheckError),
     Codegen(CodegenError),
     Io(io::Error),
 }
@@ -86,6 +93,7 @@ pub enum ProjectError {
 impl fmt::Display for ProjectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Type(error) => error.fmt(f),
             Self::Codegen(error) => error.fmt(f),
             Self::Io(error) => error.fmt(f),
         }
@@ -1509,7 +1517,7 @@ fn std_function(
 }
 
 /// Built-in standard library modules that may be referenced without an import.
-fn is_stdlib_module(module: &str) -> bool {
+pub fn is_stdlib_module(module: &str) -> bool {
     matches!(
         module,
         "gleam/io" | "io" | "gleam/fs" | "gleam/filesystem" | "fs" | "filesystem"

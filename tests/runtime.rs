@@ -15,10 +15,10 @@ fn cc_available() -> bool {
 
 /// Parse, generate C, compile, and run a Gleam program. Returns stdout.
 fn run_gleam(src: &str, name: &str) -> String {
-    let module = gleam_parser::parse(src).expect("should parse");
+    let module = gleam_to_c::parse(src).expect("should parse");
     let dir = std::env::temp_dir().join(format!("gleam-parser-test-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
-    gleam_parser::write_c_project(&module, &dir).expect("should generate C");
+    gleam_to_c::write_c_project(&module, &dir).expect("should generate C");
 
     let main_c = dir.join("main.c");
     let runtime_c = dir.join("gleam_runtime.c");
