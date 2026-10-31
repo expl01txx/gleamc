@@ -1,4 +1,4 @@
-# AGENT.md — gleam-parser
+# AGENT.md — gleam-to-c
 
 A Gleam → C compiler written in Rust. It parses a `.gleam` source file and
 emits a small C project (`main.c` + an embedded C runtime) that compiles with
