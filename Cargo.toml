@@ -1,0 +1,10 @@
+[package]
+name = "gleam-parser"
+version = "0.1.0"
+edition = "2021"
+description = "Tokenizer and AST parser for the Gleam programming language"
+license = "MIT"
+
+[lib]
+name = "gleam_parser"
+path = "src/lib.rs"

@@ -1,0 +1,5 @@
+target/
+gleam-out/
+gleam_std_int.html
+gleam_std_list.html
+gleam_std_string.html
