@@ -147,6 +147,49 @@ fn cli_module_end_to_end() {
 }
 
 #[test]
+fn standalone_c_end_to_end() {
+    if !cc_available() {
+        eprintln!("skipping: no C compiler available");
+        return;
+    }
+    let c = gleamc::translate_standalone(include_str!("hello.gleam"))
+        .expect("should translate to a single C file");
+    assert!(
+        !c.contains("#include \"gleam_runtime.h\""),
+        "standalone C must not reference the runtime header"
+    );
+
+    let dir = std::env::temp_dir().join("gleam-parser-test-standalone");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let c_file = dir.join("hello.c");
+    std::fs::write(&c_file, c).expect("write C file");
+    let bin = dir.join("prog");
+
+    let compile = Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Wextra"])
+        .arg(&c_file)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("failed to run cc");
+    assert!(
+        compile.status.success(),
+        "cc failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&bin).output().expect("failed to run program");
+    assert!(
+        run.status.success(),
+        "program failed:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(out.contains("push 5"), "unexpected output:\n{out}");
+}
+
+#[test]
 fn const_constructor_end_to_end() {
     if !cc_available() {
         eprintln!("skipping: no C compiler available");

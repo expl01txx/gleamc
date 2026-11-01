@@ -1,9 +1,10 @@
 # AGENT.md — gleamc
 
-A Gleam → C compiler written in Rust. It parses a `.gleam` source file and
-emits a small C project (`main.c` + an embedded C runtime) that compiles with
-any C11 compiler on a POSIX system. No external crates are used; the whole
-project is `std`-only Rust plus two hand-written C files.
+A Gleam → C compiler written in Rust. It parses a `.gleam` source file,
+translates it to C11 against an embedded C runtime, and compiles the result
+into a native binary with `cc` (cleaning up the generated C files afterwards).
+With `-c` it emits a single self-contained C file instead. No external crates
+are used; the whole project is `std`-only Rust plus two hand-written C files.
 
 ## Repository layout
 
@@ -15,7 +16,7 @@ src/
   parser.rs       recursive-descent parser producing a Module
   typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; also embeds the runtime via include_str!
-  main.rs         CLI: `gleamc <file.gleam> -o <dir>`
+  main.rs         CLI: `gleamc <file.gleam> [-o <dir>] [-c]`; auto-compiles with cc
   runtime/
     gleam_runtime.h   GValue model + all runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + all stdlib function bodies
@@ -37,15 +38,28 @@ gleam_std_*.html  vendored stdlib docs (string, int, list, ...)
 
 ```sh
 cargo build
-./target/debug/gleamc tests/hello.gleam -o /tmp/out
-cc -std=c11 -Wall -Wextra /tmp/out/main.c /tmp/out/gleam_runtime.c -o /tmp/prog
-/tmp/prog
+./target/debug/gleamc tests/hello.gleam      # -> ./program, gleam-out removed
+./program
+./target/debug/gleamc tests/hello.gleam -c   # -> gleam-out/hello.c (single file)
+cc -std=c11 -Wall -Wextra gleam-out/hello.c -o prog
+prog
 cargo test    # parser tests + e2e runtime tests (skipped if no cc)
 ```
 
-`write_c_project` writes `main.c`, `gleam_runtime.c`, and `gleam_runtime.h`
-into the output directory. The generated `main.c` includes
-`"gleam_runtime.h"`; only `main.c` and `gleam_runtime.c` need to be compiled.
+The default CLI mode stages the C project in `gleam-out` (or `-o <dir>`),
+compiles it with `cc -std=c11 -Wall -Wextra` into `./program`, and removes
+the staging directory on success (on failure the C files are kept).
+`-c` writes one self-contained C file — `<stem>.c` in the output directory —
+with the runtime header and source embedded, buildable with a single `cc`
+invocation.
+
+Library entry points: `write_c_project` writes `main.c`, `gleam_runtime.c`, and
+`gleam_runtime.h` into a directory (the generated `main.c` includes
+`"gleam_runtime.h"`; only the two `.c` files need compiling). `translate`
+parses, type checks, and codegens to the module C source; `translate_standalone`
+does the same but returns one self-contained C file (`generate_c_standalone`
+wraps `generate_c`: it inlines `gleam_runtime.h` in place of the include and
+appends the runtime source with its preamble stripped).
 
 ## Architecture
 

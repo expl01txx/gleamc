@@ -37,7 +37,10 @@ pub mod parser;
 pub mod typechecker;
 
 pub use ast::*;
-pub use codegen::{generate_c, translate, write_c_project, CodegenError, CompileError};
+pub use codegen::{
+    generate_c, generate_c_standalone, translate, translate_standalone, write_c_project,
+    CodegenError, CompileError,
+};
 pub use lexer::{lex, Token, TokenKind};
 pub use parser::parse_module;
 pub use typechecker::{typecheck, typecheck_source, TypeCheckError};

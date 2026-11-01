@@ -1,6 +1,6 @@
 # gleamc
 
-A [Gleam](https://gleam.run/) → C compiler written in Rust. It parses a `.gleam` source file and emits a small C project (`main.c` plus an embedded C runtime) that compiles with any C11 compiler on a POSIX system.
+A [Gleam](https://gleam.run/) → C compiler written in Rust. It parses a `.gleam` source file, translates it to C11 against an embedded C runtime, and compiles the result into a native binary with `cc`. With `-c` it instead emits a single self-contained C file you can compile yourself.
 
 No external crates — the whole project is `std`-only Rust plus two hand-written C files.
 
@@ -19,17 +19,21 @@ No external crates — the whole project is `std`-only Rust plus two hand-writte
 # 1. Build the compiler
 cargo build
 
-# 2. Compile a Gleam program to C
-./target/debug/gleamc tests/hello.gleam -o /tmp/out
-
-# 3. Build the generated C project with any C11 compiler
-cc -std=c11 -Wall -Wextra /tmp/out/main.c /tmp/out/gleam_runtime.c -o /tmp/prog
-
-# 4. Run it
-/tmp/prog
+# 2. Compile a Gleam program straight to a native binary
+./target/debug/gleamc tests/hello.gleam
+./program
 ```
 
-The output directory contains `main.c`, `gleam_runtime.c`, and `gleam_runtime.h`. Only `main.c` and `gleam_runtime.c` need to be compiled.
+By default `gleamc` generates the C files in a staging directory (`gleam-out`), compiles them with `cc -std=c11 -Wall -Wextra` into `./program`, and removes the staging directory again. If the compile fails, the C files are kept so you can fix and build them manually.
+
+To emit C instead of a binary, pass `-c`: this writes a single self-contained C file (runtime embedded) that compiles with one command:
+
+```sh
+./target/debug/gleamc tests/hello.gleam -c
+cd gleam-out && cc -std=c11 -Wall -Wextra hello.c -o program && ./program
+```
+
+`-o <dir>` changes the staging/output directory in both modes (default: `gleam-out`).
 
 ### Example
 
@@ -57,9 +61,8 @@ end-to-end test in `tests/runtime.rs`:
 Run one:
 
 ```sh
-./target/debug/gleamc examples/basic.gleam -o /tmp/out
-cc -std=c11 -Wall -Wextra /tmp/out/main.c /tmp/out/gleam_runtime.c -o /tmp/prog
-/tmp/prog
+./target/debug/gleamc examples/basic.gleam
+./program
 ```
 
 ## How it works
@@ -103,7 +106,7 @@ src/
   parser.rs       recursive-descent parser producing a Module
   typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; embeds the runtime via include_str!
-  main.rs         CLI: gleamc <file.gleam> -o <dir>
+  main.rs         CLI: gleamc <file.gleam> [-o <dir>] [-c]; auto-compiles with cc
   runtime/
     gleam_runtime.h   GValue model + runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + stdlib function bodies
