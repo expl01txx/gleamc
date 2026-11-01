@@ -19,6 +19,10 @@ pub const RUNTIME_SOURCE: &str = include_str!("runtime/gleam_runtime.c");
 pub struct CodegenError {
     pub message: String,
     pub span: Span,
+    /// 1-based line number (only when the source text is available).
+    pub line: Option<u32>,
+    /// 1-based column number (only when the source text is available).
+    pub col: Option<u32>,
 }
 
 impl CodegenError {
@@ -26,13 +30,18 @@ impl CodegenError {
         Self {
             message: message.into(),
             span,
+            line: None,
+            col: None,
         }
     }
 }
 
 impl fmt::Display for CodegenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "C codegen at byte {}: {}", self.span.start, self.message)
+        match (self.line, self.col) {
+            (Some(line), Some(col)) => write!(f, "{line}:{col}: C codegen: {}", self.message),
+            _ => write!(f, "C codegen at byte {}: {}", self.span.start, self.message),
+        }
     }
 }
 
@@ -53,12 +62,24 @@ pub fn generate_c(module: &Module) -> Result<String, CodegenError> {
 
 /// Type check the module, then write `main.c`, `gleam_runtime.c`, and
 /// `gleam_runtime.h` into a directory.
-pub fn write_c_project(module: &Module, directory: impl AsRef<Path>) -> Result<(), ProjectError> {
-    typechecker::typecheck(module).map_err(ProjectError::Type)?;
-    let source = generate_c(module).map_err(ProjectError::Codegen)?;
+pub fn write_c_project(
+    source: &str,
+    module: &Module,
+    directory: impl AsRef<Path>,
+) -> Result<(), ProjectError> {
+    typechecker::typecheck_source(source, module).map_err(ProjectError::Type)?;
+    let c_source = match generate_c(module) {
+        Ok(c) => c,
+        Err(mut error) => {
+            let (line, col) = error.span.line_col(source);
+            error.line = Some(line);
+            error.col = Some(col);
+            return Err(ProjectError::Codegen(error));
+        }
+    };
     let directory = directory.as_ref();
     fs::create_dir_all(directory).map_err(ProjectError::Io)?;
-    fs::write(directory.join("main.c"), source).map_err(ProjectError::Io)?;
+    fs::write(directory.join("main.c"), c_source).map_err(ProjectError::Io)?;
     fs::write(directory.join("gleam_runtime.c"), RUNTIME_SOURCE).map_err(ProjectError::Io)?;
     fs::write(directory.join("gleam_runtime.h"), RUNTIME_HEADER).map_err(ProjectError::Io)?;
     Ok(())

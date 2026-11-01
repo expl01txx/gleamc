@@ -27,7 +27,7 @@ fn main() -> ExitCode {
         .map_err(|error| error.to_string())
         .and_then(|source| {
             let module = gleam_to_c::parse(&source).map_err(|error| error.to_string())?;
-            write_c_project(&module, &output).map_err(|error| error.to_string())
+            write_c_project(&source, &module, &output).map_err(|error| error.to_string())
         });
     match result {
         Ok(()) => {

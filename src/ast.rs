@@ -29,6 +29,15 @@ impl Span {
             end: self.end.max(other.end),
         }
     }
+
+    /// The 1-based (line, column) of `start` within `source`.
+    pub fn line_col(&self, source: &str) -> (u32, u32) {
+        let pos = self.start.min(source.len());
+        let prefix = &source[..pos];
+        let line = prefix.matches('\n').count() as u32 + 1;
+        let col = prefix.rfind('\n').map(|i| pos - i - 1).unwrap_or(pos) as u32 + 1;
+        (line, col)
+    }
 }
 
 impl fmt::Display for Span {
@@ -61,7 +70,7 @@ impl ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "line {}:{}: {}", self.line, self.col, self.message)
+        write!(f, "{}:{}: {}", self.line, self.col, self.message)
     }
 }
 

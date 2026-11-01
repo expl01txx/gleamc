@@ -46,7 +46,7 @@ impl TypeCheckError {
 impl fmt::Display for TypeCheckError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.line, self.col) {
-            (Some(line), Some(col)) => write!(f, "line {line}:{col}: {}", self.message),
+            (Some(line), Some(col)) => write!(f, "{line}:{col}: {}", self.message),
             _ => write!(
                 f,
                 "at byte {}..{}: {}",
@@ -1337,10 +1337,7 @@ impl<'a> Checker<'a> {
     fn error(&self, message: impl Into<String>, span: Span) -> TypeCheckError {
         let mut error = TypeCheckError::new(message, span);
         if let Some(source) = self.source {
-            let pos = span.start.min(source.len());
-            let prefix = &source[..pos];
-            let line = prefix.matches('\n').count() as u32 + 1;
-            let col = prefix.rfind('\n').map(|i| pos - i - 1).unwrap_or(pos) as u32 + 1;
+            let (line, col) = span.line_col(source);
             error.line = Some(line);
             error.col = Some(col);
         }
