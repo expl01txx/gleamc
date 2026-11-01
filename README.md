@@ -1,4 +1,4 @@
-# gleam-to-c
+# gleamc
 
 A [Gleam](https://gleam.run/) → C compiler written in Rust. It parses a `.gleam` source file and emits a small C project (`main.c` plus an embedded C runtime) that compiles with any C11 compiler on a POSIX system.
 
@@ -20,7 +20,7 @@ No external crates — the whole project is `std`-only Rust plus two hand-writte
 cargo build
 
 # 2. Compile a Gleam program to C
-./target/debug/gleam-to-c tests/hello.gleam -o /tmp/out
+./target/debug/gleamc tests/hello.gleam -o /tmp/out
 
 # 3. Build the generated C project with any C11 compiler
 cc -std=c11 -Wall -Wextra /tmp/out/main.c /tmp/out/gleam_runtime.c -o /tmp/prog
@@ -83,7 +83,7 @@ src/
   parser.rs       recursive-descent parser producing a Module
   typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; embeds the runtime via include_str!
-  main.rs         CLI: gleam-to-c <file.gleam> -o <dir>
+  main.rs         CLI: gleamc <file.gleam> -o <dir>
   runtime/
     gleam_runtime.h   GValue model + runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + stdlib function bodies

@@ -1,4 +1,4 @@
-use gleam_to_c::write_c_project;
+use gleamc::write_c_project;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ fn main() -> ExitCode {
     let result = fs::read_to_string(&input)
         .map_err(|error| error.to_string())
         .and_then(|source| {
-            let module = gleam_to_c::parse(&source).map_err(|error| error.to_string())?;
+            let module = gleamc::parse(&source).map_err(|error| error.to_string())?;
             write_c_project(&source, &module, &output).map_err(|error| error.to_string())
         });
     match result {

@@ -1,4 +1,4 @@
-# AGENT.md — gleam-to-c
+# AGENT.md — gleamc
 
 A Gleam → C compiler written in Rust. It parses a `.gleam` source file and
 emits a small C project (`main.c` + an embedded C runtime) that compiles with
@@ -15,7 +15,7 @@ src/
   parser.rs       recursive-descent parser producing a Module
   typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; also embeds the runtime via include_str!
-  main.rs         CLI: `gleam-to-c <file.gleam> -o <dir>`
+  main.rs         CLI: `gleamc <file.gleam> -o <dir>`
   runtime/
     gleam_runtime.h   GValue model + all runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + all stdlib function bodies
@@ -32,7 +32,7 @@ gleam_std_*.html  vendored stdlib docs (string, int, list, ...)
 
 ```sh
 cargo build
-./target/debug/gleam-to-c tests/hello.gleam -o /tmp/out
+./target/debug/gleamc tests/hello.gleam -o /tmp/out
 cc -std=c11 -Wall -Wextra /tmp/out/main.c /tmp/out/gleam_runtime.c -o /tmp/prog
 /tmp/prog
 cargo test    # parser tests + e2e runtime tests (skipped if no cc)

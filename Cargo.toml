@@ -1,10 +1,10 @@
 [package]
-name = "gleam-to-c"
+name = "gleamc"
 version = "0.1.0"
 edition = "2021"
 description = "Tokenizer and AST parser for the Gleam programming language"
 license = "MIT"
 
 [lib]
-name = "gleam_to_c"
+name = "gleamc"
 path = "src/lib.rs"

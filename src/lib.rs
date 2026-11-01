@@ -1,4 +1,4 @@
-//! # gleam-to-c
+//! # gleamc
 //!
 //! A compiler for a subset of the [Gleam](https://gleam-lang.io/) functional
 //! programming language to C11, implemented in Rust.
@@ -16,7 +16,7 @@
 //! ## Usage
 //!
 //! ```
-//! use gleam_to_c::{parse, translate};
+//! use gleamc::{parse, translate};
 //!
 //! let module = parse(r#"
 //!     import gleam/io

@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "gleam-to-c"
+name = "gleamc"
 version = "0.1.0"
