@@ -403,6 +403,12 @@ impl Env {
         env.types.insert("int/IntError".into(), TypeInfo { params: vec![], kind: TypeKind::Bare });
         env.insert_ctor("InvalidBase", "IntError", Some("int"), &[], &[]);
 
+        // list.ContinueOrStop (returned by the `list.fold_until` function).
+        env.types.insert("list/ContinueOrStop".into(), TypeInfo { params: vec!["a".into()], kind: TypeKind::Bare });
+        for name in ["Continue", "Stop"] {
+            env.insert_ctor(name, "ContinueOrStop", Some("list"), &["a"], &[ann_var("a")]);
+        }
+
         // fs.Error
         env.types.insert("fs/Error".into(), TypeInfo { params: vec![], kind: TypeKind::Bare });
         for name in ["NotFound", "PermissionDenied"] {
@@ -456,112 +462,607 @@ fn std_function(sub: &mut Subst, module: &str, name: &str) -> Option<(Type, Vec<
         matches!(module, "gleam/fs" | "gleam/filesystem" | "fs" | "filesystem"),
         matches!(module, "gleam/string" | "string"),
         matches!(module, "gleam/int" | "int"),
+        matches!(module, "gleam/list" | "list"),
         name,
     ) {
-        (true, _, _, _, "print") => Some((t_fn(vec![s()], t_nil()), vec![Some("message".into())])),
-        (true, _, _, _, "println") => Some((t_fn(vec![s()], t_nil()), vec![Some("message".into())])),
-        (true, _, _, _, "debug") => {
+        (true, _, _, _, _, "print") => Some((t_fn(vec![s()], t_nil()), vec![Some("message".into())])),
+        (true, _, _, _, _, "println") => Some((t_fn(vec![s()], t_nil()), vec![Some("message".into())])),
+        (true, _, _, _, _, "debug") => {
             let a = sub.fresh(); // opaque parameter, fresh per lookup
             Some((t_fn(vec![a], t_nil()), vec![Some("value".into())]))
         }
-        (true, _, _, _, "read_line") => Some((t_fn(vec![], s()), vec![])),
-        (_, true, _, _, "read" | "read_file") => Some((
+        (true, _, _, _, _, "read_line") => Some((t_fn(vec![], s()), vec![])),
+        (_, true, _, _, _, "read" | "read_file") => Some((
             t_fn(vec![s()], t_result(s(), t_app("fs/Error"))),
             vec![Some("path".into())],
         )),
-        (_, true, _, _, "write" | "write_file") => Some((
+        (_, true, _, _, _, "write" | "write_file") => Some((
             t_fn(vec![s(), s()], t_result(t_nil(), t_app("fs/Error"))),
             vec![Some("path".into()), Some("contents".into())],
         )),
-        (_, true, _, _, "append" | "append_file") => Some((
+        (_, true, _, _, _, "append" | "append_file") => Some((
             t_fn(vec![s(), s()], t_result(t_nil(), t_app("fs/Error"))),
             vec![Some("path".into()), Some("contents".into())],
         )),
-        (_, true, _, _, "remove" | "delete") => Some((
+        (_, true, _, _, _, "remove" | "delete") => Some((
             t_fn(vec![s()], t_result(t_nil(), t_app("fs/Error"))),
             vec![Some("path".into())],
         )),
-        (_, true, _, _, "is_file") => Some((t_fn(vec![s()], t_bool()), vec![Some("path".into())])),
-        (_, true, _, _, "is_directory") => Some((t_fn(vec![s()], t_bool()), vec![Some("path".into())])),
-        (_, true, _, _, "create_directory") => Some((
+        (_, true, _, _, _, "is_file") => Some((t_fn(vec![s()], t_bool()), vec![Some("path".into())])),
+        (_, true, _, _, _, "is_directory") => Some((t_fn(vec![s()], t_bool()), vec![Some("path".into())])),
+        (_, true, _, _, _, "create_directory") => Some((
             t_fn(vec![s()], t_result(t_nil(), t_app("fs/Error"))),
             vec![Some("path".into())],
         )),
-        (_, true, _, _, "list_directory" | "list") => Some((
+        (_, true, _, _, _, "list_directory" | "list") => Some((
             t_fn(vec![s()], t_result(t_list(s()), t_app("fs/Error"))),
             vec![Some("path".into())],
         )),
         // gleam/string (grapheme and UTF code point functions excluded).
-        (_, _, true, _, "append") => Some((t_fn(vec![s(), s()], s()), vec![Some("to".into()), Some("suffix".into())])),
-        (_, _, true, _, "byte_size") => Some((t_fn(vec![s()], t_int()), vec![Some("string".into())])),
-        (_, _, true, _, "capitalise") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
-        (_, _, true, _, "compare") => {
+        (_, _, true, _, _, "append") => Some((t_fn(vec![s(), s()], s()), vec![Some("to".into()), Some("suffix".into())])),
+        (_, _, true, _, _, "byte_size") => Some((t_fn(vec![s()], t_int()), vec![Some("string".into())])),
+        (_, _, true, _, _, "capitalise") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
+        (_, _, true, _, _, "compare") => {
             Some((t_fn(vec![s(), s()], t_app("order/Order")), vec![None, None]))
         }
-        (_, _, true, _, "concat") => Some((t_fn(vec![t_list(s())], s()), vec![Some("strings".into())])),
-        (_, _, true, _, "contains") => Some((t_fn(vec![s(), s()], t_bool()), vec![Some("does".into()), Some("contain".into())])),
-        (_, _, true, _, "crop") => Some((t_fn(vec![s(), s()], s()), vec![Some("from".into()), Some("before".into())])),
-        (_, _, true, _, "ends_with") => Some((t_fn(vec![s(), s()], t_bool()), vec![None, None])),
-        (_, _, true, _, "first") => Some((t_fn(vec![s()], t_result(s(), t_nil())), vec![Some("string".into())])),
-        (_, _, true, _, "inspect") => {
+        (_, _, true, _, _, "concat") => Some((t_fn(vec![t_list(s())], s()), vec![Some("strings".into())])),
+        (_, _, true, _, _, "contains") => Some((t_fn(vec![s(), s()], t_bool()), vec![Some("does".into()), Some("contain".into())])),
+        (_, _, true, _, _, "crop") => Some((t_fn(vec![s(), s()], s()), vec![Some("from".into()), Some("before".into())])),
+        (_, _, true, _, _, "ends_with") => Some((t_fn(vec![s(), s()], t_bool()), vec![None, None])),
+        (_, _, true, _, _, "first") => Some((t_fn(vec![s()], t_result(s(), t_nil())), vec![Some("string".into())])),
+        (_, _, true, _, _, "inspect") => {
             let a = sub.fresh(); // opaque parameter, fresh per lookup
             Some((t_fn(vec![a], s()), vec![Some("term".into())]))
         }
-        (_, _, true, _, "is_empty") => Some((t_fn(vec![s()], t_bool()), vec![Some("str".into())])),
-        (_, _, true, _, "join") => Some((t_fn(vec![t_list(s()), s()], s()), vec![Some("strings".into()), Some("with".into())])),
-        (_, _, true, _, "last") => Some((t_fn(vec![s()], t_result(s(), t_nil())), vec![Some("string".into())])),
-        (_, _, true, _, "length") => Some((t_fn(vec![s()], t_int()), vec![Some("string".into())])),
-        (_, _, true, _, "lowercase") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
-        (_, _, true, _, "pad_end") => Some((t_fn(vec![s(), t_int(), s()], s()), vec![Some("string".into()), Some("to".into()), Some("with".into())])),
-        (_, _, true, _, "pad_start") => Some((t_fn(vec![s(), t_int(), s()], s()), vec![Some("string".into()), Some("to".into()), Some("with".into())])),
-        (_, _, true, _, "remove_prefix") => Some((t_fn(vec![s(), s()], s()), vec![Some("from".into()), Some("matching".into())])),
-        (_, _, true, _, "remove_suffix") => Some((t_fn(vec![s(), s()], s()), vec![Some("from".into()), Some("matching".into())])),
-        (_, _, true, _, "repeat") => Some((t_fn(vec![s(), t_int()], s()), vec![Some("string".into()), Some("times".into())])),
-        (_, _, true, _, "replace") => Some((t_fn(vec![s(), s(), s()], s()), vec![Some("in".into()), Some("each".into()), Some("with".into())])),
-        (_, _, true, _, "reverse") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
-        (_, _, true, _, "slice") => Some((t_fn(vec![s(), t_int(), t_int()], s()), vec![Some("from".into()), Some("at_index".into()), Some("length".into())])),
-        (_, _, true, _, "split") => Some((t_fn(vec![s(), s()], t_list(s())), vec![None, Some("on".into())])),
-        (_, _, true, _, "split_once") => Some((
+        (_, _, true, _, _, "is_empty") => Some((t_fn(vec![s()], t_bool()), vec![Some("str".into())])),
+        (_, _, true, _, _, "join") => Some((t_fn(vec![t_list(s()), s()], s()), vec![Some("strings".into()), Some("with".into())])),
+        (_, _, true, _, _, "last") => Some((t_fn(vec![s()], t_result(s(), t_nil())), vec![Some("string".into())])),
+        (_, _, true, _, _, "length") => Some((t_fn(vec![s()], t_int()), vec![Some("string".into())])),
+        (_, _, true, _, _, "lowercase") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
+        (_, _, true, _, _, "pad_end") => Some((t_fn(vec![s(), t_int(), s()], s()), vec![Some("string".into()), Some("to".into()), Some("with".into())])),
+        (_, _, true, _, _, "pad_start") => Some((t_fn(vec![s(), t_int(), s()], s()), vec![Some("string".into()), Some("to".into()), Some("with".into())])),
+        (_, _, true, _, _, "remove_prefix") => Some((t_fn(vec![s(), s()], s()), vec![Some("from".into()), Some("matching".into())])),
+        (_, _, true, _, _, "remove_suffix") => Some((t_fn(vec![s(), s()], s()), vec![Some("from".into()), Some("matching".into())])),
+        (_, _, true, _, _, "repeat") => Some((t_fn(vec![s(), t_int()], s()), vec![Some("string".into()), Some("times".into())])),
+        (_, _, true, _, _, "replace") => Some((t_fn(vec![s(), s(), s()], s()), vec![Some("in".into()), Some("each".into()), Some("with".into())])),
+        (_, _, true, _, _, "reverse") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
+        (_, _, true, _, _, "slice") => Some((t_fn(vec![s(), t_int(), t_int()], s()), vec![Some("from".into()), Some("at_index".into()), Some("length".into())])),
+        (_, _, true, _, _, "split") => Some((t_fn(vec![s(), s()], t_list(s())), vec![None, Some("on".into())])),
+        (_, _, true, _, _, "split_once") => Some((
             t_fn(vec![s(), s()], t_result(Type::Tuple(vec![s(), s()]), t_nil())),
             vec![Some("string".into()), Some("on".into())],
         )),
-        (_, _, true, _, "starts_with") => Some((t_fn(vec![s(), s()], t_bool()), vec![None, None])),
-        (_, _, true, _, "to_option") => Some((t_fn(vec![s()], t_option(s())), vec![Some("string".into())])),
-        (_, _, true, _, "trim") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
-        (_, _, true, _, "trim_end") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
-        (_, _, true, _, "trim_start") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
-        (_, _, true, _, "uppercase") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
+        (_, _, true, _, _, "starts_with") => Some((t_fn(vec![s(), s()], t_bool()), vec![None, None])),
+        (_, _, true, _, _, "to_option") => Some((t_fn(vec![s()], t_option(s())), vec![Some("string".into())])),
+        (_, _, true, _, _, "trim") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
+        (_, _, true, _, _, "trim_end") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
+        (_, _, true, _, _, "trim_start") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
+        (_, _, true, _, _, "uppercase") => Some((t_fn(vec![s()], s()), vec![Some("string".into())])),
         // gleam/int.
-        (_, _, _, true, "absolute_value") => Some((t_fn(vec![t_int()], t_int()), vec![Some("num".into())])),
-        (_, _, _, true, "clamp") => Some((t_fn(int(3), t_int()), vec![None, Some("min".into()), Some("max".into())])),
-        (_, _, _, true, "compare") => Some((t_fn(vec![t_int(), t_int()], t_app("order/Order")), vec![None, None])),
-        (_, _, _, true, "digits") => Some((
+        (_, _, _, true, _, "absolute_value") => Some((t_fn(vec![t_int()], t_int()), vec![Some("num".into())])),
+        (_, _, _, true, _, "clamp") => Some((t_fn(int(3), t_int()), vec![None, Some("min".into()), Some("max".into())])),
+        (_, _, _, true, _, "compare") => Some((t_fn(vec![t_int(), t_int()], t_app("order/Order")), vec![None, None])),
+        (_, _, _, true, _, "digits") => Some((
             t_fn(vec![t_int(), t_int()], t_result(t_list(t_int()), t_app("int/IntError"))),
             vec![Some("number".into()), Some("base".into())],
         )),
-        (_, _, _, true, "is_even") => Some((t_fn(vec![t_int()], t_bool()), vec![Some("x".into())])),
-        (_, _, _, true, "is_odd") => Some((t_fn(vec![t_int()], t_bool()), vec![Some("x".into())])),
-        (_, _, _, true, "max") => Some((t_fn(vec![t_int(), t_int()], t_int()), vec![None, None])),
-        (_, _, _, true, "min") => Some((t_fn(vec![t_int(), t_int()], t_int()), vec![None, None])),
-        (_, _, _, true, "negate") => Some((t_fn(vec![t_int()], t_int()), vec![Some("x".into())])),
-        (_, _, _, true, "parse") => Some((t_fn(vec![s()], t_result(t_int(), t_nil())), vec![Some("string".into())])),
-        (_, _, _, true, "product") => Some((t_fn(vec![t_list(t_int())], t_int()), vec![Some("numbers".into())])),
-        (_, _, _, true, "random") => Some((t_fn(vec![t_int(), t_int()], t_int()), vec![None, None])),
-        (_, _, _, true, "sum") => Some((t_fn(vec![t_list(t_int())], t_int()), vec![Some("numbers".into())])),
-        (_, _, _, true, "to_base16") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
-        (_, _, _, true, "to_base2") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
-        (_, _, _, true, "to_base36") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
-        (_, _, _, true, "to_base8") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
-        (_, _, _, true, "to_base_string") => Some((
+        (_, _, _, true, _, "is_even") => Some((t_fn(vec![t_int()], t_bool()), vec![Some("x".into())])),
+        (_, _, _, true, _, "is_odd") => Some((t_fn(vec![t_int()], t_bool()), vec![Some("x".into())])),
+        (_, _, _, true, _, "max") => Some((t_fn(vec![t_int(), t_int()], t_int()), vec![None, None])),
+        (_, _, _, true, _, "min") => Some((t_fn(vec![t_int(), t_int()], t_int()), vec![None, None])),
+        (_, _, _, true, _, "negate") => Some((t_fn(vec![t_int()], t_int()), vec![Some("x".into())])),
+        (_, _, _, true, _, "parse") => Some((t_fn(vec![s()], t_result(t_int(), t_nil())), vec![Some("string".into())])),
+        (_, _, _, true, _, "product") => Some((t_fn(vec![t_list(t_int())], t_int()), vec![Some("numbers".into())])),
+        (_, _, _, true, _, "random") => Some((t_fn(vec![t_int(), t_int()], t_int()), vec![None, None])),
+        (_, _, _, true, _, "sum") => Some((t_fn(vec![t_list(t_int())], t_int()), vec![Some("numbers".into())])),
+        (_, _, _, true, _, "to_base16") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
+        (_, _, _, true, _, "to_base2") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
+        (_, _, _, true, _, "to_base36") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
+        (_, _, _, true, _, "to_base8") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
+        (_, _, _, true, _, "to_base_string") => Some((
             t_fn(vec![t_int(), t_int()], t_result(s(), t_app("int/IntError"))),
             vec![Some("int".into()), Some("base".into())],
         )),
-        (_, _, _, true, "to_float") => Some((t_fn(vec![t_int()], t_float()), vec![Some("int".into())])),
-        (_, _, _, true, "to_string") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
-        (_, _, _, true, "undigits") => Some((
+        (_, _, _, true, _, "to_float") => Some((t_fn(vec![t_int()], t_float()), vec![Some("int".into())])),
+        (_, _, _, true, _, "to_string") => Some((t_fn(vec![t_int()], s()), vec![Some("int".into())])),
+        (_, _, _, true, _, "undigits") => Some((
             t_fn(vec![t_list(t_int()), t_int()], t_result(t_int(), t_app("int/IntError"))),
             vec![Some("numbers".into()), Some("base".into())],
         )),
+        // gleam/list. `group` is excluded: it requires `gleam/dict`.
+        (_, _, _, _, true, "all") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())], t_bool()),
+                vec![Some("in".into()), Some("satisfying".into())],
+            ))
+        }
+        (_, _, _, _, true, "any") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())], t_bool()),
+                vec![Some("in".into()), Some("satisfying".into())],
+            ))
+        }
+        (_, _, _, _, true, "append") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_list(a.clone())], t_list(a.clone())),
+                vec![],
+            ))
+        }
+        (_, _, _, _, true, "chunk") => {
+            let a = sub.fresh();
+            let k = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], k.clone())], t_list(t_list(a.clone()))),
+                vec![Some("in".into()), Some("by".into())],
+            ))
+        }
+        (_, _, _, _, true, "combination_pairs") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone())], t_list(Type::Tuple(vec![a.clone().clone(), a.clone()]))),
+                vec![None],
+            ))
+        }
+        (_, _, _, _, true, "combinations") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_int()], t_list(t_list(a.clone()))),
+                vec![None, Some("by".into())],
+            ))
+        }
+        (_, _, _, _, true, "contains") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone().clone()), a.clone()], t_bool()), vec![]))
+        }
+        (_, _, _, _, true, "count") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())], t_int()),
+                vec![Some("list".into()), Some("where".into())],
+            ))
+        }
+        (_, _, _, _, true, "drop") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_int()], t_list(a.clone())),
+                vec![Some("from".into()), Some("up_to".into())],
+            ))
+        }
+        (_, _, _, _, true, "drop_while") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())], t_list(a.clone())),
+                vec![Some("in".into()), Some("satisfying".into())],
+            ))
+        }
+        (_, _, _, _, true, "each") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone()), t_fn(vec![b.clone()], t_nil())], t_nil()), vec![]))
+        }
+        (_, _, _, _, true, "filter") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())], t_list(a.clone())),
+                vec![Some("list".into()), Some("keeping".into())],
+            ))
+        }
+        (_, _, _, _, true, "filter_map") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            let e = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone()), t_fn(vec![b.clone()], t_result(b.clone().clone(), e.clone()))], t_list(b.clone())),
+                vec![Some("list".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "find") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())], t_result(a.clone(), t_nil())),
+                vec![Some("in".into()), Some("one_that".into())],
+            ))
+        }
+        (_, _, _, _, true, "find_map") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            let c = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone()), t_fn(vec![b.clone()], t_result(b.clone().clone(), c.clone()))], t_result(b.clone(), t_nil())),
+                vec![Some("in".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "first") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone().clone())], t_result(a.clone(), t_nil())), vec![None]))
+        }
+        (_, _, _, _, true, "flat_map") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone()), t_fn(vec![b.clone()], t_list(b.clone().clone()))], t_list(b.clone())),
+                vec![Some("over".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "flatten") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(t_list(a.clone().clone()))], t_list(a.clone())), vec![None]))
+        }
+        (_, _, _, _, true, "fold") => {
+            let a = sub.fresh();
+            let acc = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone()), acc.clone().clone(), t_fn(vec![acc.clone().clone(), a.clone()], acc.clone().clone())],
+                    acc.clone(),
+                ),
+                vec![Some("over".into()), Some("from".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "fold_right") => {
+            let a = sub.fresh();
+            let acc = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone()), acc.clone().clone(), t_fn(vec![acc.clone().clone(), a.clone()], acc.clone().clone())],
+                    acc.clone(),
+                ),
+                vec![Some("over".into()), Some("from".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "fold_until") => {
+            let a = sub.fresh();
+            let acc = sub.fresh();
+            let step = Type::app_args(Some("list".into()), "ContinueOrStop", vec![acc.clone().clone()]);
+            Some((
+                t_fn(vec![t_list(a.clone()), acc.clone().clone(), t_fn(vec![acc.clone().clone(), a.clone()], step)], acc.clone()),
+                vec![Some("over".into()), Some("from".into()), Some("with".into())],
+            ))
+        }
+        // `group` needs `gleam/dict`, which this compiler does not have.
+        (_, _, _, _, true, "index_fold") => {
+            let a = sub.fresh();
+            let acc = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone()), acc.clone().clone(), t_fn(vec![acc.clone().clone(), a.clone(), t_int()], acc.clone().clone())],
+                    acc.clone(),
+                ),
+                vec![Some("over".into()), Some("from".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "index_map") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone()), t_fn(vec![a.clone(), t_int()], b.clone())], t_list(b.clone())),
+                vec![Some("list".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "interleave") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(t_list(a.clone().clone()))], t_list(a.clone())), vec![None]))
+        }
+        (_, _, _, _, true, "intersperse") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), a.clone()], t_list(a.clone())),
+                vec![Some("list".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "is_empty") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone())], t_bool()), vec![None]))
+        }
+        (_, _, _, _, true, "key_filter") => {
+            let k = sub.fresh();
+            let v = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(Type::Tuple(vec![k.clone().clone(), v.clone().clone()])), k.clone()],
+                    t_list(v.clone()),
+                ),
+                vec![Some("in".into()), Some("find".into())],
+            ))
+        }
+        (_, _, _, _, true, "key_find") => {
+            let k = sub.fresh();
+            let v = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(Type::Tuple(vec![k.clone(), v.clone()])), k.clone()],
+                    t_result(v.clone(), t_nil()),
+                ),
+                vec![Some("in".into()), Some("find".into())],
+            ))
+        }
+        (_, _, _, _, true, "key_pop") => {
+            let k = sub.fresh();
+            let v = sub.fresh();
+            let pair = Type::Tuple(vec![k.clone().clone(), v.clone().clone()]);
+            Some((
+                t_fn(
+                    vec![t_list(pair.clone()), k.clone()],
+                    t_result(Type::Tuple(vec![v.clone(), t_list(pair)]), t_nil()),
+                ),
+                vec![None, Some("key".into())],
+            ))
+        }
+        (_, _, _, _, true, "key_set") => {
+            let k = sub.fresh();
+            let v = sub.fresh();
+            let pair = Type::Tuple(vec![k.clone().clone(), v.clone().clone()]);
+            Some((
+                t_fn(vec![t_list(pair.clone()), k.clone(), v.clone()], t_list(pair)),
+                vec![None, Some("key".into()), Some("value".into())],
+            ))
+        }
+        (_, _, _, _, true, "last") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone().clone())], t_result(a.clone(), t_nil())), vec![None]))
+        }
+        (_, _, _, _, true, "length") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone())], t_int()), vec![Some("of".into())]))
+        }
+        (_, _, _, _, true, "map") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone()), t_fn(vec![b.clone()], b.clone())], t_list(b.clone())),
+                vec![Some("list".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "map2") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            let c = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone()), t_list(b.clone()), t_fn(vec![a.clone(), b.clone()], c.clone())], t_list(c.clone())),
+                vec![None, None, Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "map_fold") => {
+            let a = sub.fresh();
+            let acc = sub.fresh();
+            let b = sub.fresh();
+            Some((
+                t_fn(
+                    vec![
+                        t_list(a.clone()),
+                        acc.clone().clone(),
+                        t_fn(vec![acc.clone().clone(), a.clone()], Type::Tuple(vec![acc.clone().clone(), b.clone().clone()])),
+                    ],
+                    Type::Tuple(vec![acc.clone(), t_list(b.clone())]),
+                ),
+                vec![Some("over".into()), Some("from".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "max") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone().clone()), t_fn(vec![a.clone().clone(), a.clone()], t_app("order/Order"))],
+                    t_result(a.clone(), t_nil()),
+                ),
+                vec![Some("over".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "new") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![], t_list(a.clone())), vec![]))
+        }
+        (_, _, _, _, true, "partition") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())],
+                    Type::Tuple(vec![t_list(a.clone().clone()), t_list(a.clone())]),
+                ),
+                vec![Some("list".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "permutations") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone().clone())], t_list(t_list(a.clone()))), vec![None]))
+        }
+        (_, _, _, _, true, "prepend") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), a.clone()], t_list(a.clone())),
+                vec![Some("to".into()), Some("this".into())],
+            ))
+        }
+        (_, _, _, _, true, "reduce") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone().clone(), a.clone()], a.clone())], t_result(a.clone(), t_nil())),
+                vec![Some("over".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "repeat") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![a.clone().clone(), t_int()], t_list(a.clone())), vec![Some("item".into()), Some("times".into())]))
+        }
+        (_, _, _, _, true, "rest") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone())], t_result(t_list(a.clone()), t_nil())),
+                vec![None],
+            ))
+        }
+        (_, _, _, _, true, "reverse") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone().clone())], t_list(a.clone())), vec![None]))
+        }
+        (_, _, _, _, true, "sample") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_int()], t_list(a.clone())),
+                vec![Some("from".into()), Some("up_to".into())],
+            ))
+        }
+        (_, _, _, _, true, "scan") => {
+            let a = sub.fresh();
+            let acc = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone()), acc.clone().clone(), t_fn(vec![acc.clone().clone(), a.clone()], acc.clone().clone())],
+                    t_list(acc.clone()),
+                ),
+                vec![Some("over".into()), Some("from".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "shuffle") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone().clone())], t_list(a.clone())), vec![None]))
+        }
+        (_, _, _, _, true, "sized_chunk") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_int()], t_list(t_list(a.clone()))),
+                vec![Some("in".into()), Some("into".into())],
+            ))
+        }
+        (_, _, _, _, true, "sort") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone().clone()), t_fn(vec![a.clone().clone(), a.clone()], t_app("order/Order"))],
+                    t_list(a.clone()),
+                ),
+                vec![Some("list".into()), Some("by".into())],
+            ))
+        }
+        (_, _, _, _, true, "split") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone().clone()), t_int()],
+                    Type::Tuple(vec![t_list(a.clone().clone()), t_list(a.clone())]),
+                ),
+                vec![Some("list".into()), Some("at".into())],
+            ))
+        }
+        (_, _, _, _, true, "split_while") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())],
+                    Type::Tuple(vec![t_list(a.clone().clone()), t_list(a.clone())]),
+                ),
+                vec![Some("list".into()), Some("satisfying".into())],
+            ))
+        }
+        (_, _, _, _, true, "strict_zip") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone()), t_list(b.clone())],
+                    t_result(t_list(Type::Tuple(vec![a.clone(), b.clone()])), t_nil()),
+                ),
+                vec![Some("list".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "take") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_int()], t_list(a.clone())),
+                vec![Some("from".into()), Some("up_to".into())],
+            ))
+        }
+        (_, _, _, _, true, "take_while") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_fn(vec![a.clone()], t_bool())], t_list(a.clone())),
+                vec![Some("in".into()), Some("satisfying".into())],
+            ))
+        }
+        (_, _, _, _, true, "transpose") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(t_list(a.clone().clone()))], t_list(t_list(a.clone()))),
+                vec![None],
+            ))
+        }
+        (_, _, _, _, true, "try_each") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            let e = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone()), t_fn(vec![b.clone()], t_result(b.clone(), e.clone().clone()))], t_result(t_nil(), e.clone())),
+                vec![Some("over".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "try_fold") => {
+            let a = sub.fresh();
+            let acc = sub.fresh();
+            let e = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone()), acc.clone().clone(), t_fn(vec![acc.clone().clone(), a.clone()], t_result(acc.clone().clone(), e.clone().clone()))],
+                    t_result(acc.clone(), e.clone()),
+                ),
+                vec![Some("over".into()), Some("from".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "try_map") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            let e = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone()), t_fn(vec![b.clone()], t_result(b.clone().clone(), e.clone().clone()))], t_result(t_list(b.clone()), e.clone())),
+                vec![Some("over".into()), Some("with".into())],
+            ))
+        }
+        (_, _, _, _, true, "unique") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![t_list(a.clone().clone())], t_list(a.clone())), vec![None]))
+        }
+        (_, _, _, _, true, "unzip") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(Type::Tuple(vec![a.clone().clone(), b.clone().clone()]))],
+                    Type::Tuple(vec![t_list(a.clone()), t_list(b.clone())]),
+                ),
+                vec![None],
+            ))
+        }
+        (_, _, _, _, true, "window") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone()), t_int()], t_list(t_list(a.clone()))),
+                vec![Some("list".into()), Some("by".into())],
+            ))
+        }
+        (_, _, _, _, true, "window_by_2") => {
+            let a = sub.fresh();
+            Some((
+                t_fn(vec![t_list(a.clone().clone())], t_list(Type::Tuple(vec![a.clone().clone(), a.clone()]))),
+                vec![None],
+            ))
+        }
+        (_, _, _, _, true, "wrap") => {
+            let a = sub.fresh();
+            Some((t_fn(vec![a.clone()], t_list(a.clone())), vec![None]))
+        }
+        (_, _, _, _, true, "zip") => {
+            let a = sub.fresh();
+            let b = sub.fresh();
+            Some((
+                t_fn(
+                    vec![t_list(a.clone()), t_list(b.clone())],
+                    t_list(Type::Tuple(vec![a.clone(), b.clone()])),
+                ),
+                vec![Some("list".into()), Some("with".into())],
+            ))
+        }
         _ => None,
     }
 }

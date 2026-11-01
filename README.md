@@ -10,7 +10,7 @@ No external crates — the whole project is `std`-only Rust plus two hand-writte
 - Hindley–Milner style type checker with unification (runs before codegen)
 - Code generator that translates the AST to portable C11
 - All values are a single tagged union (`GValue`); heap types (strings, lists, tuples, records, closures) are refcounted
-- Native C implementations of the standard library modules: `gleam/io`, `gleam/fs`, `gleam/string`, `gleam/int`
+- Native C implementations of the standard library modules: `gleam/io`, `gleam/fs`, `gleam/string`, `gleam/int`, `gleam/list`
 - End-to-end tests that compile the generated C with `cc` and run it
 
 ## Quick start
@@ -68,6 +68,7 @@ carry source spans and, when the source text is available, line/column numbers.
 | `gleam/fs` | `read`, `write`, `append`, `remove`, `is_file`, `is_directory`, `create_directory`, `list_directory` |
 | `gleam/string` | 31 functions (grapheme/UTF functions excluded) |
 | `gleam/int` | all 21 functions |
+| `gleam/list` | 64 functions (`group` excluded — it needs `gleam/dict`) |
 
 These modules work without an explicit import.
 
@@ -90,7 +91,7 @@ tests/
   typecheck.rs    type checker tests: programs that must check, and ones that must fail
   runtime.rs      end-to-end tests: parse → typecheck → codegen → cc → run → assert stdout
   hello.gleam     small demo program used by an e2e test
-  string_test.gleam / int_test.gleam   stdlib test programs
+  string_test.gleam / int_test.gleam / list_test.gleam   stdlib test programs
 gleam_std_*.html  vendored stdlib docs (string, int, list, ...)
 ```
 

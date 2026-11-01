@@ -271,9 +271,13 @@ GValue g_string_concat(GValue left, GValue right) {
   if (right.tag != G_STRING) g_type_error("String", right, __FILE__, __LINE__);
   GString *a = left.as.pointer;
   GString *b = right.as.pointer;
-  GValue result = g_string_n(a->data, a->length + b->length);
-  GString *out = result.as.pointer;
-  memcpy(out->data + a->length, b->data, b->length);
+  size_t total = a->length + b->length;
+  char *buffer = malloc(total + 1);
+  memcpy(buffer, a->data, a->length);
+  memcpy(buffer + a->length, b->data, b->length);
+  buffer[total] = '\0';
+  GValue result = g_string_n(buffer, total);
+  free(buffer);
   return result;
 }
 
@@ -776,8 +780,9 @@ GValue gleam_string_concat(GValue *args, size_t argc) {
     cursor = list->tail;
   }
   if (cursor.tag != G_NIL) g_type_error("List", cursor, __FILE__, __LINE__);
-  GValue result = g_string_n("", total);
-  GString *out = result.as.pointer;
+  GString *out = allocate(sizeof(GString) + total + 1);
+  out->header.refs = 1;
+  out->length = total;
   size_t offset = 0;
   cursor = args[0];
   while (cursor.tag == G_LIST) {
@@ -787,6 +792,9 @@ GValue gleam_string_concat(GValue *args, size_t argc) {
     offset += element->length;
     cursor = list->tail;
   }
+  out->data[total] = '\0';
+  GValue result = {.tag = G_STRING};
+  result.as.pointer = out;
   return result;
 }
 
@@ -902,8 +910,9 @@ GValue gleam_string_join(GValue *args, size_t argc) {
   }
   if (cursor.tag != G_NIL) g_type_error("List", cursor, __FILE__, __LINE__);
   if (count > 1) total += (size_t)(count - 1) * separator->length;
-  GValue result = g_string_n("", total);
-  GString *out = result.as.pointer;
+  GString *out = allocate(sizeof(GString) + total + 1);
+  out->header.refs = 1;
+  out->length = total;
   size_t offset = 0;
   int first = 1;
   cursor = args[0];
@@ -919,6 +928,9 @@ GValue gleam_string_join(GValue *args, size_t argc) {
     first = 0;
     cursor = list->tail;
   }
+  out->data[total] = '\0';
+  GValue result = {.tag = G_STRING};
+  result.as.pointer = out;
   return result;
 }
 
@@ -935,9 +947,9 @@ static GValue pad(const GString *string, int64_t desired, const GString *pad,
                                   string->length);
   if (desired <= (int64_t)current || pad->length == 0) return g_string_n(string->data, string->length);
   size_t needed = (size_t)desired - current;
-  GValue result =
-      g_string_n("", string->length + needed);
-  GString *out = result.as.pointer;
+  GString *out = allocate(sizeof(GString) + string->length + needed + 1);
+  out->header.refs = 1;
+  out->length = string->length + needed;
   if (at_start) {
     for (size_t i = 0; i < needed; ++i)
       out->data[i] = pad->data[i % pad->length];
@@ -947,6 +959,9 @@ static GValue pad(const GString *string, int64_t desired, const GString *pad,
     for (size_t i = 0; i < needed; ++i)
       out->data[string->length + i] = pad->data[i % pad->length];
   }
+  out->data[out->length] = '\0';
+  GValue result = {.tag = G_STRING};
+  result.as.pointer = out;
   return result;
 }
 
@@ -990,11 +1005,15 @@ GValue gleam_string_repeat(GValue *args, size_t argc) {
   int64_t times = require_int(args[1]);
   if (times <= 0 || string->length == 0) return g_string("");
   size_t total = string->length * (size_t)times;
-  GValue result = g_string_n("", total);
-  GString *out = result.as.pointer;
+  GString *out = allocate(sizeof(GString) + total + 1);
+  out->header.refs = 1;
+  out->length = total;
   for (int64_t i = 0; i < times; ++i)
     memcpy(out->data + (size_t)i * string->length, string->data,
            string->length);
+  out->data[total] = '\0';
+  GValue result = {.tag = G_STRING};
+  result.as.pointer = out;
   return result;
 }
 
@@ -1014,8 +1033,9 @@ GValue gleam_string_replace(GValue *args, size_t argc) {
   }
   size_t total = string->length - occurrences * pattern->length +
                  occurrences * substitute->length;
-  GValue result = g_string_n("", total);
-  GString *out = result.as.pointer;
+  GString *out = allocate(sizeof(GString) + total + 1);
+  out->header.refs = 1;
+  out->length = total;
   size_t offset = 0;
   for (const char *cursor = string->data; cursor < end;) {
     const char *found = strstr(cursor, pattern->data);
@@ -1030,6 +1050,9 @@ GValue gleam_string_replace(GValue *args, size_t argc) {
     offset += substitute->length;
     cursor = found + pattern->length;
   }
+  out->data[total] = '\0';
+  GValue result = {.tag = G_STRING};
+  result.as.pointer = out;
   return result;
 }
 
@@ -1436,4 +1459,1214 @@ GValue gleam_int_undigits(GValue *args, size_t argc) {
     list = ((GList*)list.as.pointer)->tail;
   }
   return g_record("Ok", 1, (GValue[]){g_int(value)});
+}
+
+// ---------------------------------------------------------------------------
+// gleam/list
+// ---------------------------------------------------------------------------
+
+static GValue require_list(GValue value) {
+  if (value.tag != G_LIST && value.tag != G_NIL)
+    g_type_error("List", value, __FILE__, __LINE__);
+  return value;
+}
+
+// Copy a list into an array of owned elements: `items[i]` points at a
+// retained copy of the i-th element. The caller transfers every element
+// into a new structure (or leaks it) and then calls list_free.
+static GValue **list_collect(GValue list, size_t *count) {
+  size_t length = g_list_length(list);
+  GValue **items = malloc((length ? length : 1) * sizeof(GValue *));
+  size_t index = 0;
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue *slot = malloc(sizeof(GValue));
+    *slot = g_retain(cell->head);
+    items[index++] = slot;
+    list = cell->tail;
+  }
+  *count = index;
+  return items;
+}
+
+// Release every element still owned by the array and free the slots.
+static void list_free(GValue **items, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    g_release(*items[i]);
+    free(items[i]);
+  }
+  free(items);
+}
+
+// Build a list from owned elements in forward order. Prepending must go
+// from the last element to the first so the list reads in index order.
+static GValue list_build(GValue **items, size_t count) {
+  GValue result = g_list_empty();
+  for (size_t i = count; i-- > 0;)
+    result = g_list_prepend(g_retain(*items[i]), result);
+  return result;
+}
+
+// Copy a list in reverse order.
+static GValue list_reverse(GValue list) {
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    result = g_list_prepend(g_retain(cell->head), result);
+    list = cell->tail;
+  }
+  return result;
+}
+
+// Reverse a locally built list and release the original chain. Every
+// element must already hold its own reference (as list_collect copies do).
+static GValue list_reverse_own(GValue list) {
+  GValue result = list_reverse(list);
+  g_release(list);
+  return result;
+}
+
+// Append two lists. Takes ownership of both: the first is copied cell by
+// cell (so a shared prefix is never mutated) and then released, and the
+// second becomes the tail of the result.
+static GValue list_take_append(GValue first, GValue second) {
+  size_t count;
+  GValue **items = list_collect(first, &count);
+  GValue result = second;
+  for (size_t i = count; i-- > 0;)
+    result = g_list_prepend(g_retain(*items[i]), result);
+  list_free(items, count);
+  g_release(first);
+  return result;
+}
+
+GValue gleam_list_all(GValue *args, size_t argc) {
+  require_args("list.all", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue predicate = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(predicate, (GValue[]){cell->head}, 1);
+    int pass = ok.as.boolean;
+    g_release(ok);
+    if (!pass) return g_bool(0);
+    list = cell->tail;
+  }
+  return g_bool(1);
+}
+
+GValue gleam_list_any(GValue *args, size_t argc) {
+  require_args("list.any", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue predicate = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(predicate, (GValue[]){cell->head}, 1);
+    int pass = ok.as.boolean;
+    g_release(ok);
+    if (pass) return g_bool(1);
+    list = cell->tail;
+  }
+  return g_bool(0);
+}
+
+GValue gleam_list_append(GValue *args, size_t argc) {
+  require_args("list.append", 2, argc);
+  return list_take_append(g_retain(require_list(args[0])),
+                          g_retain(require_list(args[1])));
+}
+
+// Group consecutive elements whose `by` key compares equal.
+GValue gleam_list_chunk(GValue *args, size_t argc) {
+  require_args("list.chunk", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue by = args[1];
+  if (list.tag == G_NIL) return g_list_empty();
+  GList *cell = list.as.pointer;
+  GValue key = g_call(by, (GValue[]){cell->head}, 1);
+  GValue chunk = g_list_prepend(g_retain(cell->head), g_list_empty());
+  GValue result = g_list_empty();
+  list = cell->tail;
+  while (list.tag == G_LIST) {
+    GList *next = list.as.pointer;
+    GValue next_key = g_call(by, (GValue[]){next->head}, 1);
+    if (g_equal(key, next_key)) {
+      chunk = g_list_prepend(g_retain(next->head), chunk);
+      g_release(next_key);
+    } else {
+      result = g_list_prepend(chunk, result);
+      chunk = g_list_prepend(g_retain(next->head), g_list_empty());
+      g_release(key);
+      key = next_key;
+    }
+    list = next->tail;
+  }
+  // Chunks were collected front-to-back; restore the order.
+  return list_reverse_own(g_list_prepend(chunk, result));
+}
+
+GValue gleam_list_combination_pairs(GValue *args, size_t argc) {
+  require_args("list.combination_pairs", 1, argc);
+  size_t count;
+  GValue **items = list_collect(require_list(args[0]), &count);
+  GValue result = g_list_empty();
+  for (size_t i = count; i-- > 0;) {
+    for (size_t j = count - 1; j > i; --j) {
+      // Each element appears in several pairs, so every tuple gets its
+      // own retained references.
+      GValue pair = g_tuple(2, (GValue[]){g_retain(*items[i]),
+                                         g_retain(*items[j])});
+      result = g_list_prepend(pair, result);
+    }
+  }
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_combinations(GValue *args, size_t argc) {
+  require_args("list.combinations", 2, argc);
+  GValue list = require_list(args[0]);
+  int64_t n = require_int(args[1]);
+  size_t count;
+  GValue **items = list_collect(list, &count);
+  if (n <= 0 || (uint64_t)n > count) {
+    list_free(items, count);
+    return g_list_empty();
+  }
+  size_t width = (size_t)n;
+  // Index combination in lexicographic order: start at [0..width) and
+  // advance the rightmost position that is not yet at its maximum.
+  size_t *index = malloc(width * sizeof(size_t));
+  for (size_t i = 0; i < width; ++i) index[i] = i;
+  GValue result = g_list_empty();
+  for (;;) {
+    GValue combo = g_list_empty();
+    for (size_t i = width; i-- > 0;)
+      combo = g_list_prepend(g_retain(*items[index[i]]), combo);
+    result = g_list_prepend(combo, result);
+    size_t i = width;
+    while (i > 0 && index[i - 1] == count - (width - (i - 1))) --i;
+    if (i == 0) break;
+    ++index[i - 1];
+    for (size_t j = i; j < width; ++j) index[j] = index[j - 1] + 1;
+  }
+  free(index);
+  list_free(items, count);
+  // Each combination was prepended, so reverse to keep the lexicographic
+  // order of the index choices.
+  return list_reverse_own(result);
+}
+
+GValue gleam_list_contains(GValue *args, size_t argc) {
+  require_args("list.contains", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue elem = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    if (g_equal(cell->head, elem)) return g_bool(1);
+    list = cell->tail;
+  }
+  return g_bool(0);
+}
+
+GValue gleam_list_count(GValue *args, size_t argc) {
+  require_args("list.count", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue predicate = args[1];
+  int64_t count = 0;
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(predicate, (GValue[]){cell->head}, 1);
+    if (ok.as.boolean) ++count;
+    g_release(ok);
+    list = cell->tail;
+  }
+  return g_int(count);
+}
+
+GValue gleam_list_drop(GValue *args, size_t argc) {
+  require_args("list.drop", 2, argc);
+  GValue list = require_list(args[0]);
+  int64_t n = require_int(args[1]);
+  while (list.tag == G_LIST && n > 0) {
+    list = ((GList*)list.as.pointer)->tail;
+    --n;
+  }
+  // The tail shares cells with the input list, so it needs its own
+  // reference.
+  return g_retain(list);
+}
+
+GValue gleam_list_drop_while(GValue *args, size_t argc) {
+  require_args("list.drop_while", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue predicate = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(predicate, (GValue[]){cell->head}, 1);
+    int pass = ok.as.boolean;
+    g_release(ok);
+    if (!pass) break;
+    list = cell->tail;
+  }
+  return g_retain(list);
+}
+
+GValue gleam_list_each(GValue *args, size_t argc) {
+  require_args("list.each", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue result = g_call(fun, (GValue[]){cell->head}, 1);
+    g_release(result);
+    list = cell->tail;
+  }
+  return g_nil();
+}
+
+GValue gleam_list_filter(GValue *args, size_t argc) {
+  require_args("list.filter", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue predicate = args[1];
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(predicate, (GValue[]){cell->head}, 1);
+    int pass = ok.as.boolean;
+    g_release(ok);
+    if (pass) result = g_list_prepend(g_retain(cell->head), result);
+    list = cell->tail;
+  }
+  return list_reverse_own(result);
+}
+
+GValue gleam_list_filter_map(GValue *args, size_t argc) {
+  require_args("list.filter_map", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue mapped = g_call(fun, (GValue[]){cell->head}, 1);
+    if (g_record_is(mapped, "Ok"))
+      result = g_list_prepend(g_retain(g_record_get(mapped, 0)), result);
+    g_release(mapped);
+    list = cell->tail;
+  }
+  return list_reverse_own(result);
+}
+
+GValue gleam_list_find(GValue *args, size_t argc) {
+  require_args("list.find", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue predicate = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(predicate, (GValue[]){cell->head}, 1);
+    int pass = ok.as.boolean;
+    g_release(ok);
+    if (pass) return g_record("Ok", 1, (GValue[]){g_retain(cell->head)});
+    list = cell->tail;
+  }
+  return g_record("Error", 1, (GValue[]){g_nil()});
+}
+
+GValue gleam_list_find_map(GValue *args, size_t argc) {
+  require_args("list.find_map", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue mapped = g_call(fun, (GValue[]){cell->head}, 1);
+    if (g_record_is(mapped, "Ok")) {
+      GValue value = g_retain(g_record_get(mapped, 0));
+      g_release(mapped);
+      return g_record("Ok", 1, (GValue[]){value});
+    }
+    g_release(mapped);
+    list = cell->tail;
+  }
+  return g_record("Error", 1, (GValue[]){g_nil()});
+}
+
+GValue gleam_list_first(GValue *args, size_t argc) {
+  require_args("list.first", 1, argc);
+  GValue list = require_list(args[0]);
+  if (list.tag == G_NIL) return g_record("Error", 1, (GValue[]){g_nil()});
+  return g_record("Ok", 1, (GValue[]){g_retain(((GList*)list.as.pointer)->head)});
+}
+
+GValue gleam_list_flat_map(GValue *args, size_t argc) {
+  require_args("list.flat_map", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  size_t outer;
+  GValue **elements = list_collect(list, &outer);
+  // Map every element to a list first, then count the total.
+  GValue *mapped = malloc(outer * sizeof(GValue));
+  size_t total = 0;
+  for (size_t i = 0; i < outer; ++i) {
+    mapped[i] = require_list(g_call(fun, (GValue[]){*elements[i]}, 1));
+    total += g_list_length(mapped[i]);
+  }
+  GValue **items = malloc((total ? total : 1) * sizeof(GValue *));
+  size_t index = 0;
+  for (size_t i = 0; i < outer; ++i) {
+    GValue inner = mapped[i];
+    while (inner.tag == G_LIST) {
+      GList *cell = inner.as.pointer;
+      GValue *slot = malloc(sizeof(GValue));
+      *slot = g_retain(cell->head);
+      items[index++] = slot;
+      inner = cell->tail;
+    }
+  }
+  for (size_t i = 0; i < outer; ++i) {
+    g_release(mapped[i]);
+    g_release(*elements[i]);
+    free(elements[i]);
+  }
+  free(mapped);
+  free(elements);
+  GValue result = list_build(items, index);
+  list_free(items, index);
+  return result;
+}
+
+GValue gleam_list_flatten(GValue *args, size_t argc) {
+  require_args("list.flatten", 1, argc);
+  GValue lists = require_list(args[0]);
+  size_t outer;
+  GValue **rows = list_collect(lists, &outer);
+  size_t total = 0;
+  for (size_t i = 0; i < outer; ++i)
+    total += g_list_length(require_list(*rows[i]));
+  GValue **items = malloc((total ? total : 1) * sizeof(GValue *));
+  size_t index = 0;
+  for (size_t i = 0; i < outer; ++i) {
+    GValue inner = require_list(*rows[i]);
+    while (inner.tag == G_LIST) {
+      GList *cell = inner.as.pointer;
+      GValue *slot = malloc(sizeof(GValue));
+      *slot = g_retain(cell->head);
+      items[index++] = slot;
+      inner = cell->tail;
+    }
+  }
+  for (size_t i = 0; i < outer; ++i) {
+    g_release(*rows[i]);
+    free(rows[i]);
+  }
+  free(rows);
+  GValue result = list_build(items, index);
+  list_free(items, index);
+  return result;
+}
+
+GValue gleam_list_fold(GValue *args, size_t argc) {
+  require_args("list.fold", 3, argc);
+  GValue list = require_list(args[0]);
+  // The arguments are released by the caller after this returns, so take
+  // an owned reference to the accumulator before reassigning it.
+  GValue acc = g_retain(args[1]);
+  GValue fun = args[2];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue next = g_call(fun, (GValue[]){acc, cell->head}, 2);
+    g_release(acc);
+    acc = next;
+    list = cell->tail;
+  }
+  return acc;
+}
+
+GValue gleam_list_fold_right(GValue *args, size_t argc) {
+  require_args("list.fold_right", 3, argc);
+  // Folding right-to-left is a left fold over the reversed list.
+  // A local reversed copy for the traversal; released when done.
+  GValue reversed = list_reverse(require_list(args[0]));
+  GValue list = reversed;
+  GValue acc = g_retain(args[1]);
+  GValue fun = args[2];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue next = g_call(fun, (GValue[]){acc, cell->head}, 2);
+    g_release(acc);
+    acc = next;
+    list = cell->tail;
+  }
+  g_release(reversed);
+  return acc;
+}
+
+GValue gleam_list_fold_until(GValue *args, size_t argc) {
+  require_args("list.fold_until", 3, argc);
+  GValue list = require_list(args[0]);
+  GValue acc = g_retain(args[1]);
+  GValue fun = args[2];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue step = g_call(fun, (GValue[]){acc, cell->head}, 2);
+    int stop = !g_record_is(step, "Continue");
+    GValue next = g_retain(g_record_get(step, 0));
+    g_release(step);
+    g_release(acc);
+    acc = next;
+    if (stop) return acc;
+    list = cell->tail;
+  }
+  return acc;
+}
+
+GValue gleam_list_index_fold(GValue *args, size_t argc) {
+  require_args("list.index_fold", 3, argc);
+  GValue list = require_list(args[0]);
+  GValue acc = g_retain(args[1]);
+  GValue fun = args[2];
+  int64_t index = 0;
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue next = g_call(fun, (GValue[]){acc, cell->head, g_int(index)}, 3);
+    g_release(acc);
+    acc = next;
+    ++index;
+    list = cell->tail;
+  }
+  return acc;
+}
+
+GValue gleam_list_index_map(GValue *args, size_t argc) {
+  require_args("list.index_map", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  GValue result = g_list_empty();
+  int64_t index = 0;
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    result = g_list_prepend(
+        g_call(fun, (GValue[]){cell->head, g_int(index)}, 2), result);
+    ++index;
+    list = cell->tail;
+  }
+  return list_reverse_own(result);
+}
+
+// Take the first element of every inner list, then the second, and so on.
+GValue gleam_list_interleave(GValue *args, size_t argc) {
+  require_args("list.interleave", 1, argc);
+  size_t rows;
+  GValue **items = list_collect(require_list(args[0]), &rows);
+  GValue result = g_list_empty();
+  for (size_t column = 0;; ++column) {
+    int found = 0;
+    for (size_t i = 0; i < rows; ++i) {
+      GValue row = *items[i];
+      for (size_t c = 0; c < column && row.tag == G_LIST; ++c)
+        row = ((GList*)row.as.pointer)->tail;
+      if (row.tag == G_LIST) {
+        result = g_list_prepend(g_retain(((GList*)row.as.pointer)->head), result);
+        found = 1;
+      }
+    }
+    if (!found) break;
+  }
+  list_free(items, rows);
+  return list_reverse_own(result);
+}
+
+GValue gleam_list_intersperse(GValue *args, size_t argc) {
+  require_args("list.intersperse", 2, argc);
+  GValue elem = args[1];
+  size_t count;
+  GValue **items = list_collect(require_list(args[0]), &count);
+  GValue result = g_list_empty();
+  for (size_t i = count; i-- > 0;) {
+    result = g_list_prepend(g_retain(*items[i]), result);
+    // The separator precedes every element except the first.
+    if (i > 0) result = g_list_prepend(g_retain(elem), result);
+  }
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_is_empty(GValue *args, size_t argc) {
+  require_args("list.is_empty", 1, argc);
+  return g_bool(require_list(args[0]).tag == G_NIL);
+}
+
+GValue gleam_list_key_filter(GValue *args, size_t argc) {
+  require_args("list.key_filter", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue key = args[1];
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    if (g_equal(g_tuple_get(cell->head, 0), key))
+      result = g_list_prepend(g_retain(g_tuple_get(cell->head, 1)), result);
+    list = cell->tail;
+  }
+  return list_reverse_own(result);
+}
+
+GValue gleam_list_key_find(GValue *args, size_t argc) {
+  require_args("list.key_find", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue key = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    if (g_equal(g_tuple_get(cell->head, 0), key))
+      return g_record("Ok", 1, (GValue[]){g_retain(g_tuple_get(cell->head, 1))});
+    list = cell->tail;
+  }
+  return g_record("Error", 1, (GValue[]){g_nil()});
+}
+
+GValue gleam_list_key_pop(GValue *args, size_t argc) {
+  require_args("list.key_pop", 2, argc);
+  GValue key = args[1];
+  size_t count;
+  GValue **items = list_collect(require_list(args[0]), &count);
+  int64_t found = -1;
+  for (size_t i = 0; i < count; ++i) {
+    if (g_equal(g_tuple_get(*items[i], 0), key)) {
+      found = (int64_t)i;
+      break;
+    }
+  }
+  if (found < 0) {
+    list_free(items, count);
+    return g_record("Error", 1, (GValue[]){g_nil()});
+  }
+  GValue value = g_retain(g_tuple_get(*items[found], 1));
+  GValue rest = g_list_empty();
+  for (size_t i = count; i-- > 0;) {
+    if ((int64_t)i == found) continue;
+    rest = g_list_prepend(g_retain(*items[i]), rest);
+  }
+  list_free(items, count);
+  return g_record("Ok", 1, (GValue[]){g_tuple(2, (GValue[]){value, rest})});
+}
+
+GValue gleam_list_key_set(GValue *args, size_t argc) {
+  require_args("list.key_set", 3, argc);
+  GValue key = args[1];
+  GValue value = args[2];
+  size_t count;
+  GValue **items = list_collect(require_list(args[0]), &count);
+  int64_t found = -1;
+  for (size_t i = 0; i < count; ++i) {
+    if (g_equal(g_tuple_get(*items[i], 0), key)) {
+      found = (int64_t)i;
+      break;
+    }
+  }
+  GValue pair = g_tuple(2, (GValue[]){g_retain(key), g_retain(value)});
+  GValue result = g_list_empty();
+  if (found < 0) {
+    // A new entry goes to the end of the list, which is prepended first.
+    result = g_list_prepend(pair, result);
+    for (size_t i = count; i-- > 0;)
+      result = g_list_prepend(g_retain(*items[i]), result);
+  } else {
+    for (size_t i = count; i-- > 0;) {
+      if ((int64_t)i == found) result = g_list_prepend(g_retain(pair), result);
+      else result = g_list_prepend(g_retain(*items[i]), result);
+    }
+    g_release(pair);
+  }
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_last(GValue *args, size_t argc) {
+  require_args("list.last", 1, argc);
+  GValue list = require_list(args[0]);
+  if (list.tag == G_NIL) return g_record("Error", 1, (GValue[]){g_nil()});
+  while (((GList*)list.as.pointer)->tail.tag == G_LIST)
+    list = ((GList*)list.as.pointer)->tail;
+  return g_record("Ok", 1, (GValue[]){g_retain(((GList*)list.as.pointer)->head)});
+}
+
+GValue gleam_list_length(GValue *args, size_t argc) {
+  require_args("list.length", 1, argc);
+  return g_int((int64_t)g_list_length(require_list(args[0])));
+}
+
+GValue gleam_list_map(GValue *args, size_t argc) {
+  require_args("list.map", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    result = g_list_prepend(g_call(fun, (GValue[]){cell->head}, 1), result);
+    list = cell->tail;
+  }
+  return list_reverse_own(result);
+}
+
+GValue gleam_list_map2(GValue *args, size_t argc) {
+  require_args("list.map2", 3, argc);
+  GValue list1 = require_list(args[0]);
+  GValue list2 = require_list(args[1]);
+  GValue fun = args[2];
+  GValue result = g_list_empty();
+  while (list1.tag == G_LIST && list2.tag == G_LIST) {
+    GList *cell1 = list1.as.pointer;
+    GList *cell2 = list2.as.pointer;
+    result = g_list_prepend(
+        g_call(fun, (GValue[]){cell1->head, cell2->head}, 2), result);
+    list1 = cell1->tail;
+    list2 = cell2->tail;
+  }
+  return list_reverse_own(result);
+}
+
+GValue gleam_list_map_fold(GValue *args, size_t argc) {
+  require_args("list.map_fold", 3, argc);
+  GValue list = require_list(args[0]);
+  GValue acc = g_retain(args[1]);
+  GValue fun = args[2];
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue pair = g_call(fun, (GValue[]){acc, cell->head}, 2);
+    GValue next = g_retain(g_tuple_get(pair, 0));
+    result = g_list_prepend(g_retain(g_tuple_get(pair, 1)), result);
+    g_release(pair);
+    g_release(acc);
+    acc = next;
+    list = cell->tail;
+  }
+  return g_tuple(2, (GValue[]){acc, list_reverse_own(result)});
+}
+
+GValue gleam_list_max(GValue *args, size_t argc) {
+  require_args("list.max", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue compare = args[1];
+  if (list.tag == G_NIL) return g_record("Error", 1, (GValue[]){g_nil()});
+  GList *cell = list.as.pointer;
+  GValue best = g_retain(cell->head);
+  list = cell->tail;
+  while (list.tag == G_LIST) {
+    GList *next = list.as.pointer;
+    GValue order = g_call(compare, (GValue[]){best, next->head}, 2);
+    // `Lt` means the candidate is greater than the current best.
+    int greater = g_record_is(order, "Lt");
+    g_release(order);
+    if (greater) {
+      g_release(best);
+      best = g_retain(next->head);
+    }
+    list = next->tail;
+  }
+  return g_record("Ok", 1, (GValue[]){best});
+}
+
+GValue gleam_list_new(GValue *args, size_t argc) {
+  (void)args;
+  require_args("list.new", 0, argc);
+  return g_list_empty();
+}
+
+GValue gleam_list_partition(GValue *args, size_t argc) {
+  require_args("list.partition", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue categorise = args[1];
+  GValue yes = g_list_empty();
+  GValue no = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(categorise, (GValue[]){cell->head}, 1);
+    int pass = ok.as.boolean;
+    g_release(ok);
+    if (pass) yes = g_list_prepend(g_retain(cell->head), yes);
+    else no = g_list_prepend(g_retain(cell->head), no);
+    list = cell->tail;
+  }
+  return g_tuple(2, (GValue[]){list_reverse_own(yes), list_reverse_own(no)});
+}
+
+// Append every permutation of the rest after fixing each element in turn
+// as the first. `out` grows via realloc and owns one list per entry.
+static void permutations_rec(GValue **items, size_t length, GValue ***out,
+                             size_t *count) {
+  if (length == 0) {
+    GValue *entry = malloc(sizeof(GValue));
+    *entry = g_list_empty();
+    *out = realloc(*out, (*count + 1) * sizeof(GValue *));
+    (*out)[(*count)++] = entry;
+    return;
+  }
+  for (size_t i = 0; i < length; ++i) {
+    size_t start = *count;
+    GValue **rest = malloc((length - 1) * sizeof(GValue *));
+    size_t written = 0;
+    for (size_t j = 0; j < length; ++j)
+      if (j != i) rest[written++] = items[j];
+    permutations_rec(rest, length - 1, out, count);
+    free(rest);
+    for (size_t k = start; k < *count; ++k)
+      *(*out)[k] = g_list_prepend(g_retain(*items[i]), *(*out)[k]);
+  }
+}
+
+GValue gleam_list_permutations(GValue *args, size_t argc) {
+  require_args("list.permutations", 1, argc);
+  size_t count;
+  GValue **items = list_collect(require_list(args[0]), &count);
+  GValue **result = NULL;
+  size_t result_count = 0;
+  permutations_rec(items, count, &result, &result_count);
+  GValue list = g_list_empty();
+  for (size_t i = result_count; i-- > 0;) list = g_list_prepend(g_retain(*result[i]), list);
+  for (size_t i = 0; i < result_count; ++i) {
+    g_release(*result[i]);
+    free(result[i]);
+  }
+  free(result);
+  list_free(items, count);
+  return list;
+}
+
+GValue gleam_list_prepend(GValue *args, size_t argc) {
+  require_args("list.prepend", 2, argc);
+  // The caller releases the arguments after this returns, so both the
+  // element and the list tail need their own references.
+  return g_list_prepend(g_retain(args[1]), g_retain(require_list(args[0])));
+}
+
+GValue gleam_list_reduce(GValue *args, size_t argc) {
+  require_args("list.reduce", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  if (list.tag == G_NIL) return g_record("Error", 1, (GValue[]){g_nil()});
+  GList *cell = list.as.pointer;
+  GValue acc = g_retain(cell->head);
+  list = cell->tail;
+  while (list.tag == G_LIST) {
+    GList *next = list.as.pointer;
+    GValue step = g_call(fun, (GValue[]){acc, next->head}, 2);
+    g_release(acc);
+    acc = step;
+    list = next->tail;
+  }
+  return g_record("Ok", 1, (GValue[]){acc});
+}
+
+GValue gleam_list_repeat(GValue *args, size_t argc) {
+  require_args("list.repeat", 2, argc);
+  GValue item = args[0];
+  int64_t times = require_int(args[1]);
+  GValue result = g_list_empty();
+  for (int64_t i = 0; i < times; ++i)
+    result = g_list_prepend(g_retain(item), result);
+  return result;
+}
+
+GValue gleam_list_rest(GValue *args, size_t argc) {
+  require_args("list.rest", 1, argc);
+  GValue list = require_list(args[0]);
+  if (list.tag == G_NIL) return g_record("Error", 1, (GValue[]){g_nil()});
+  return g_record(
+      "Ok", 1, (GValue[]){g_retain(((GList*)list.as.pointer)->tail)});
+}
+
+GValue gleam_list_reverse(GValue *args, size_t argc) {
+  require_args("list.reverse", 1, argc);
+  return list_reverse(require_list(args[0]));
+}
+
+// Reservoir sampling: keep the first n elements, then replace a random slot
+// for each later element with probability n / (i + 1). The reservoir maps
+// slots to original indices so the result keeps the input order.
+GValue gleam_list_sample(GValue *args, size_t argc) {
+  require_args("list.sample", 2, argc);
+  GValue list = require_list(args[0]);
+  int64_t n = require_int(args[1]);
+  size_t count;
+  GValue **items = list_collect(list, &count);
+  if (n <= 0) {
+    list_free(items, count);
+    return g_list_empty();
+  }
+  if ((uint64_t)n >= count) {
+    GValue result = list_build(items, count);
+    list_free(items, count);
+    return result;
+  }
+  size_t width = (size_t)n;
+  size_t *reservoir = malloc(width * sizeof(size_t));
+  for (size_t i = 0; i < width; ++i) reservoir[i] = i;
+  for (size_t i = width; i < count; ++i) {
+    size_t slot = (size_t)(random_draw() % (uint64_t)(i + 1));
+    if (slot < width) reservoir[slot] = i;
+  }
+  uint8_t *selected = calloc(count, 1);
+  for (size_t i = 0; i < width; ++i) selected[reservoir[i]] = 1;
+  free(reservoir);
+  GValue result = g_list_empty();
+  for (size_t i = count; i-- > 0;) {
+    if (selected[i]) result = g_list_prepend(g_retain(*items[i]), result);
+  }
+  free(selected);
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_scan(GValue *args, size_t argc) {
+  require_args("list.scan", 3, argc);
+  GValue list = require_list(args[0]);
+  GValue acc = g_retain(args[1]);
+  GValue fun = args[2];
+  GValue result = g_list_prepend(g_retain(acc), g_list_empty());
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue next = g_call(fun, (GValue[]){acc, cell->head}, 2);
+    result = g_list_prepend(g_retain(next), result);
+    g_release(acc);
+    acc = next;
+    list = cell->tail;
+  }
+  g_release(acc);
+  return list_reverse_own(result);
+}
+
+// Fisher-Yates shuffle.
+GValue gleam_list_shuffle(GValue *args, size_t argc) {
+  require_args("list.shuffle", 1, argc);
+  size_t count;
+  GValue **items = list_collect(require_list(args[0]), &count);
+  for (size_t i = count; i > 1; --i) {
+    size_t j = (size_t)(random_draw() % (uint64_t)i);
+    GValue *tmp = items[i - 1];
+    items[i - 1] = items[j];
+    items[j] = tmp;
+  }
+  GValue result = list_build(items, count);
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_sized_chunk(GValue *args, size_t argc) {
+  require_args("list.sized_chunk", 2, argc);
+  GValue list = require_list(args[0]);
+  int64_t size = require_int(args[1]);
+  if (size < 1) size = 1;
+  size_t count;
+  GValue **items = list_collect(list, &count);
+  GValue result = g_list_empty();
+  // Build the chunks from the end of the list towards the start. The final
+  // chunk (built first) may be shorter than `size`.
+  size_t start = count % (size_t)size;
+  if (start == 0 && count > 0) start = (size_t)size;
+  for (size_t end = count; end > 0;) {
+    size_t begin = end - start;
+    GValue chunk = g_list_empty();
+    for (size_t i = end; i-- > begin;)
+      chunk = g_list_prepend(g_retain(*items[i]), chunk);
+    result = g_list_prepend(chunk, result);
+    end = begin;
+    start = (size_t)size;
+  }
+  list_free(items, count);
+  return result;
+}
+
+// Insertion sort: simple and stable for the small lists this compiler
+// targets.
+GValue gleam_list_sort(GValue *args, size_t argc) {
+  require_args("list.sort", 2, argc);
+  GValue compare = args[1];
+  size_t count;
+  GValue **items = list_collect(require_list(args[0]), &count);
+  for (size_t i = 1; i < count; ++i) {
+    GValue *key = items[i];
+    size_t j = i;
+    while (j > 0) {
+      GValue order = g_call(compare, (GValue[]){*items[j - 1], *key}, 2);
+      int greater = g_record_is(order, "Gt");
+      g_release(order);
+      if (!greater) break;
+      items[j] = items[j - 1];
+      --j;
+    }
+    items[j] = key;
+  }
+  GValue result = list_build(items, count);
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_split(GValue *args, size_t argc) {
+  require_args("list.split", 2, argc);
+  GValue list = require_list(args[0]);
+  int64_t index = require_int(args[1]);
+  size_t count;
+  GValue **items = list_collect(list, &count);
+  size_t cut =
+      index < 0 ? 0 : (uint64_t)index >= count ? count : (size_t)index;
+  GValue before = g_list_empty();
+  for (size_t i = cut; i-- > 0;) before = g_list_prepend(g_retain(*items[i]), before);
+  GValue after = g_list_empty();
+  for (size_t i = count; i-- > cut;) after = g_list_prepend(g_retain(*items[i]), after);
+  list_free(items, count);
+  return g_tuple(2, (GValue[]){before, after});
+}
+
+GValue gleam_list_split_while(GValue *args, size_t argc) {
+  require_args("list.split_while", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue predicate = args[1];
+  GValue first = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(predicate, (GValue[]){cell->head}, 1);
+    int pass = ok.as.boolean;
+    g_release(ok);
+    if (!pass) break;
+    first = g_list_prepend(g_retain(cell->head), first);
+    list = cell->tail;
+  }
+  // The remainder shares cells with the input list.
+  return g_tuple(2, (GValue[]){list_reverse_own(first), g_retain(list)});
+}
+
+GValue gleam_list_strict_zip(GValue *args, size_t argc) {
+  require_args("list.strict_zip", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue other = require_list(args[1]);
+  if (g_list_length(list) != g_list_length(other))
+    return g_record("Error", 1, (GValue[]){g_nil()});
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GList *other_cell = other.as.pointer;
+    GValue pair = g_tuple(2, (GValue[]){g_retain(cell->head),
+                                       g_retain(other_cell->head)});
+    result = g_list_prepend(pair, result);
+    list = cell->tail;
+    other = other_cell->tail;
+  }
+  return g_record("Ok", 1, (GValue[]){list_reverse_own(result)});
+}
+
+GValue gleam_list_take(GValue *args, size_t argc) {
+  require_args("list.take", 2, argc);
+  GValue list = require_list(args[0]);
+  int64_t n = require_int(args[1]);
+  if (n <= 0) return g_list_empty();
+  size_t count;
+  GValue **items = list_collect(list, &count);
+  size_t taken = (uint64_t)n < count ? (size_t)n : count;
+  GValue result = g_list_empty();
+  for (size_t i = taken; i-- > 0;) result = g_list_prepend(g_retain(*items[i]), result);
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_take_while(GValue *args, size_t argc) {
+  require_args("list.take_while", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue predicate = args[1];
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue ok = g_call(predicate, (GValue[]){cell->head}, 1);
+    int pass = ok.as.boolean;
+    g_release(ok);
+    if (!pass) break;
+    result = g_list_prepend(g_retain(cell->head), result);
+    list = cell->tail;
+  }
+  return list_reverse_own(result);
+}
+
+// Column by column: the c-th element of every row that has one.
+GValue gleam_list_transpose(GValue *args, size_t argc) {
+  require_args("list.transpose", 1, argc);
+  size_t rows;
+  GValue **items = list_collect(require_list(args[0]), &rows);
+  size_t columns = 0;
+  for (size_t i = 0; i < rows; ++i)
+    columns = g_list_length(*items[i]) > columns ? g_list_length(*items[i]) : columns;
+  GValue result = g_list_empty();
+  for (size_t column = columns; column-- > 0;) {
+    GValue col = g_list_empty();
+    int found = 0;
+    for (size_t i = rows; i-- > 0;) {
+      GValue row = *items[i];
+      for (size_t c = 0; c < column && row.tag == G_LIST; ++c)
+        row = ((GList*)row.as.pointer)->tail;
+      if (row.tag == G_LIST) {
+        col = g_list_prepend(g_retain(((GList*)row.as.pointer)->head), col);
+        found = 1;
+      }
+    }
+    if (found) result = g_list_prepend(col, result);
+  }
+  list_free(items, rows);
+  return result;
+}
+
+GValue gleam_list_try_each(GValue *args, size_t argc) {
+  require_args("list.try_each", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue step = g_call(fun, (GValue[]){cell->head}, 1);
+    if (!g_record_is(step, "Ok")) {
+      GValue error = g_retain(g_record_get(step, 0));
+      g_release(step);
+      return g_record("Error", 1, (GValue[]){error});
+    }
+    g_release(step);
+    list = cell->tail;
+  }
+  return g_record("Ok", 1, (GValue[]){g_nil()});
+}
+
+GValue gleam_list_try_fold(GValue *args, size_t argc) {
+  require_args("list.try_fold", 3, argc);
+  GValue list = require_list(args[0]);
+  GValue acc = g_retain(args[1]);
+  GValue fun = args[2];
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue step = g_call(fun, (GValue[]){acc, cell->head}, 2);
+    if (!g_record_is(step, "Ok")) {
+      GValue error = g_retain(g_record_get(step, 0));
+      g_release(step);
+      g_release(acc);
+      return g_record("Error", 1, (GValue[]){error});
+    }
+    GValue next = g_retain(g_record_get(step, 0));
+    g_release(step);
+    g_release(acc);
+    acc = next;
+    list = cell->tail;
+  }
+  return g_record("Ok", 1, (GValue[]){acc});
+}
+
+GValue gleam_list_try_map(GValue *args, size_t argc) {
+  require_args("list.try_map", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue fun = args[1];
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GValue step = g_call(fun, (GValue[]){cell->head}, 1);
+    if (!g_record_is(step, "Ok")) {
+      GValue error = g_retain(g_record_get(step, 0));
+      g_release(step);
+      g_release(result);
+      return g_record("Error", 1, (GValue[]){error});
+    }
+    result = g_list_prepend(g_retain(g_record_get(step, 0)), result);
+    g_release(step);
+    list = cell->tail;
+  }
+  return g_record("Ok", 1, (GValue[]){list_reverse_own(result)});
+}
+
+// Keep the first occurrence of each element.
+GValue gleam_list_unique(GValue *args, size_t argc) {
+  require_args("list.unique", 1, argc);
+  size_t count;
+  GValue **items = list_collect(require_list(args[0]), &count);
+  GValue result = g_list_empty();
+  for (size_t i = count; i-- > 0;) {
+    // Keep an element only when no earlier one compares equal to it.
+    int seen = 0;
+    for (size_t j = 0; j < i; ++j) {
+      if (g_equal(*items[i], *items[j])) {
+        seen = 1;
+        break;
+      }
+    }
+    if (!seen) result = g_list_prepend(g_retain(*items[i]), result);
+  }
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_unzip(GValue *args, size_t argc) {
+  require_args("list.unzip", 1, argc);
+  GValue list = require_list(args[0]);
+  GValue firsts = g_list_empty();
+  GValue seconds = g_list_empty();
+  while (list.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    firsts = g_list_prepend(g_retain(g_tuple_get(cell->head, 0)), firsts);
+    seconds = g_list_prepend(g_retain(g_tuple_get(cell->head, 1)), seconds);
+    list = cell->tail;
+  }
+  return g_tuple(2, (GValue[]){list_reverse_own(firsts), list_reverse_own(seconds)});
+}
+
+GValue gleam_list_window(GValue *args, size_t argc) {
+  require_args("list.window", 2, argc);
+  GValue list = require_list(args[0]);
+  int64_t n = require_int(args[1]);
+  size_t count;
+  GValue **items = list_collect(list, &count);
+  if (n <= 0 || (uint64_t)n > count) {
+    list_free(items, count);
+    return g_list_empty();
+  }
+  size_t width = (size_t)n;
+  GValue result = g_list_empty();
+  for (size_t start = count - width + 1; start-- > 0;) {
+    GValue window = g_list_empty();
+    for (size_t i = start + width; i-- > start;)
+      window = g_list_prepend(g_retain(*items[i]), window);
+    result = g_list_prepend(window, result);
+  }
+  list_free(items, count);
+  return result;
+}
+
+GValue gleam_list_window_by_2(GValue *args, size_t argc) {
+  require_args("list.window_by_2", 1, argc);
+  GValue list = require_list(args[0]);
+  if (list.tag == G_NIL) return g_list_empty();
+  GList *cell = list.as.pointer;
+  GValue previous = cell->head;
+  GValue result = g_list_empty();
+  list = cell->tail;
+  while (list.tag == G_LIST) {
+    GList *next = list.as.pointer;
+    GValue pair = g_tuple(2, (GValue[]){g_retain(previous),
+                                       g_retain(next->head)});
+    result = g_list_prepend(pair, result);
+    previous = next->head;
+    list = next->tail;
+  }
+  return list_reverse_own(result);
+}
+
+GValue gleam_list_wrap(GValue *args, size_t argc) {
+  require_args("list.wrap", 1, argc);
+  return g_list_prepend(g_retain(args[0]), g_list_empty());
+}
+
+GValue gleam_list_zip(GValue *args, size_t argc) {
+  require_args("list.zip", 2, argc);
+  GValue list = require_list(args[0]);
+  GValue other = require_list(args[1]);
+  GValue result = g_list_empty();
+  while (list.tag == G_LIST && other.tag == G_LIST) {
+    GList *cell = list.as.pointer;
+    GList *other_cell = other.as.pointer;
+    GValue pair = g_tuple(2, (GValue[]){g_retain(cell->head),
+                                       g_retain(other_cell->head)});
+    result = g_list_prepend(pair, result);
+    list = cell->tail;
+    other = other_cell->tail;
+  }
+  return list_reverse_own(result);
 }

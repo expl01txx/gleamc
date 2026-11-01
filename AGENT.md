@@ -24,7 +24,7 @@ tests/
   typecheck.rs    type checker tests: valid programs pass, invalid ones fail with a message
   runtime.rs      end-to-end tests: parse → typecheck → codegen → cc → run → assert stdout
   hello.gleam     small demo program used by an e2e test
-  string_test.gleam / int_test.gleam   stdlib test programs (see below)
+  string_test.gleam / int_test.gleam / list_test.gleam   stdlib test programs (see below)
 gleam_std_*.html  vendored stdlib docs (string, int, list, ...)
 ```
 
@@ -101,8 +101,9 @@ A Hindley–Milner inference engine over a single global substitution:
   lookup. **When you add a stdlib function, update both tables.**
 - Built-in types registered in `Checker::new`: `Int`, `Float`, `Bool`,
   `String`, `Nil`, `List`, `Option`, `Result`, `order/Order`,
-  `int/IntError`, `fs/Error` — with constructors `True`, `False`, `Ok`,
-  `Error`, `Some`, `None`, `Eq`, `Lt`, `Gt`, `InvalidBase`.
+  `int/IntError`, `fs/Error`, `list/ContinueOrStop` — with constructors
+  `True`, `False`, `Ok`, `Error`, `Some`, `None`, `Eq`, `Lt`, `Gt`,
+  `InvalidBase`, `Continue`, `Stop`.
 
 ### Codegen structure (`src/codegen.rs`)
 
@@ -119,15 +120,18 @@ A Hindley–Milner inference engine over a single global substitution:
   is the single table mapping `(module, function)` → `(C name, arity, labels)`.
   Labels are `None` for positional-only parameters.
 - `is_stdlib_module(module)` lists modules usable **without an import**
-  (currently: `gleam/io`, `gleam/fs`, `gleam/string`, `gleam/int`).
+  (currently: `gleam/io`, `gleam/fs`, `gleam/string`, `gleam/int`,
+  `gleam/list`).
 - Built-in constructors are registered in `Compiler::new`
-  (`Ok`, `Error`, `Some`, `None`, `Eq`, `Lt`, `Gt`, `InvalidBase`).
+  (`Ok`, `Error`, `Some`, `None`, `Eq`, `Lt`, `Gt`, `InvalidBase`,
+  `Continue`, `Stop`).
   Zero-field constructors do not get a `gleam_ctor_*` wrapper; records are
   built inline.
 
 ## How to implement a stdlib module
 
-Worked example: `gleam/string` and `gleam/int` were added this way.
+Worked example: `gleam/string`, `gleam/int`, and `gleam/list` were added
+this way.
 
 1. **Extract the docs.** The HTML is vendored in the repo root
    (`gleam_std_<module>.html`). Strip tags with a quick Python one-liner
@@ -142,8 +146,8 @@ Worked example: `gleam/string` and `gleam/int` were added this way.
 3. **Register in `src/codegen.rs`:**
    - Add an entry to `std_function` for every function:
      `Some(("gleam_<module>_<name>", arity, &[labels...]))`. The match is on
-     a tuple of module booleans `(io, fs, string, int, name)` — add a new
-     boolean + extend every existing pattern when adding a module.
+     a tuple of module booleans `(io, fs, string, int, list, name)` — add a
+     new boolean + extend every existing pattern when adding a module.
    - Add the module to `is_stdlib_module` so it works without an import.
    - Register any new custom-type constructors (e.g. `InvalidBase`) in the
      built-in constructor loop in `Compiler::new`.
@@ -191,9 +195,35 @@ Worked example: `gleam/string` and `gleam/int` were added this way.
 - Errors: `g_panic(message, __FILE__, __LINE__)` for programmer errors
   (bad arity, division by zero), `g_type_error(expected, value, ...)` for
   wrong-typed values. Both abort.
+- **Ownership across the codegen boundary**: the generated code releases
+  every call argument *after* a native stdlib call returns. So a C function
+  must `g_retain` any argument value it stores into a returned structure
+  (list cell, tuple field, record field). Returning an argument value
+  directly (e.g. `return g_retain(args[0]);`) is fine; returning it bare is a
+  use-after-free.
 - **List construction order**: `g_list_prepend` builds backwards. To produce
   `[a, b, c]` from least-significant-first data, prepend in index order
   `0, 1, 2`. (This bug has bitten us twice: `string.split` and `int.digits`.)
+- **List helpers and their ownership rules** (`gleam_runtime.c`):
+  - `list_collect(list, &count)` → array of slots; the *array owns one
+    reference per element*. End every use with `list_free(items, count)`,
+    which releases all elements. Transfer an element into a new structure
+    with `g_retain(*items[i])`.
+  - `list_build(items, count)` → list in array order; retains on transfer,
+    so call `list_free` afterwards.
+  - `list_reverse(list)` copies in reverse (borrow). `list_reverse_own(list)`
+    copies in reverse **and releases the original chain** — use it for every
+    locally built prepend list, or you leak one cell per element.
+  - Check early-return paths: any `return` after `list_collect` must
+    `list_free` first; any function building a partial result that bails out
+    with an `Error` must release the partial list.
+- **Do not pre-allocate strings with `g_string_n("", n)`** — it copies `n`
+  bytes from its source (a global-buffer-overflow). Allocate directly:
+  `GString *s = allocate(sizeof(GString) + n + 1); s->header.refs = 1;
+  s->length = n;` then fill and NUL-terminate.
+- **Verify new runtime code with ASan**: `cc -std=c11 -g -fsanitize=address`
+  the generated project, run with `ASAN_OPTIONS=detect_leaks=1`. The
+  expectation is zero errors *and* zero leaks.
 - **UTF-8 back-walks**: walking back over continuation bytes
   (`(data[i] & 0xC0) == 0x80`) stops *right after* the lead byte, so the lead
   byte is at `index - 1`. Decode at `index - 1` and slice from there.
@@ -215,7 +245,11 @@ Worked example: `gleam/string` and `gleam/int` were added this way.
   "unknown or misplaced call argument".
 - When adding a module to `std_function`, update **all** match-arm tuples and
   the two `FunctionInfo` construction sites that convert labels
-  (`label.map(|l| l.to_string())`).
+  (`label.map(|l| l.to_string()`).
+- `gen_expr` / `gen_guard` materialize their result into a named temporary
+  owning one reference (the caller releases it). Never splice an expression
+  that allocates in multiple places — each splice would allocate a separate
+  value.
 - Don't add dependencies; keep everything in `std`.
 
 ## Testing conventions
@@ -247,6 +281,7 @@ Worked example: `gleam/string` and `gleam/int` were added this way.
 
 ### Gleam language gotchas (when writing test programs)
 
+- This dialect has **no `if` expression** — use a `case` expression instead.
 - `panic as` only accepts a **string literal**, not a variable.
 - Pipelines bind looser than operators: `"a" |> f == b` parses as
   `"a" |> (f == b)` — parenthesize: `("a" |> f) == b`.
@@ -263,7 +298,7 @@ Worked example: `gleam/string` and `gleam/int` were added this way.
 | `gleam/fs` | `read`, `write`, `append`, `remove`, `is_file`, `is_directory`, `create_directory`, `list_directory` |
 | `gleam/string` | 31 functions; grapheme/UTF functions excluded (`drop_start`, `drop_end`, `pop_grapheme`, `to_graphemes`, `utf_codepoint`, `utf_codepoint_to_int`, `to_utf_codepoints`, `from_utf_codepoints`). Grapheme counting is approximated via a combining-mark table. |
 | `gleam/int` | all 21 functions |
-| `gleam/list` | **not started** — 61 functions; `group` needs `gleam/dict` (exclude it) |
+| `gleam/list` | 64 functions; `group` excluded (needs `gleam/dict`). `fold_until` uses the registered `list/ContinueOrStop` type with `Continue`/`Stop` constructors. |
 
 ## Known pitfalls (learned the hard way)
 
@@ -280,3 +315,17 @@ Worked example: `gleam/string` and `gleam/int` were added this way.
    test itself (e.g. 8 in binary is `1000`, not `100`).
 6. **`hello.gleam` is a live file** — its contents may change; the e2e test
    asserts exact stdout, so keep it in sync.
+7. **Stored arguments must be retained** — codegen releases stdlib call
+   arguments after the C function returns. If a runtime function stores an
+   argument into a returned list/tuple/record without `g_retain`, the value
+   is freed under you (see C conventions).
+8. **Locally built prepend lists leak without `list_reverse_own`** —
+   `list_reverse` only copies; the original chain stays allocated. Every
+   function that builds a list by prepending and then reversing must use
+   `list_reverse_own` (or release the original some other way).
+9. **`g_string_n("", n)` is not a pre-allocator** — it memcpys `n` bytes from
+   its source string. Use direct `allocate(...)` for fill-in-later buffers.
+10. **Leaks hide in early returns** — any path that exits before the normal
+    cleanup (`list_free`, releasing a partial result) leaks. When ASan finds
+    a leak, read the *allocation* stack (where the object came from), not the
+    current frame.

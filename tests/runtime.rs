@@ -74,6 +74,19 @@ fn int_module_end_to_end() {
 }
 
 #[test]
+fn list_module_end_to_end() {
+    if !cc_available() {
+        eprintln!("skipping: no C compiler available");
+        return;
+    }
+    let out = run_gleam(include_str!("list_test.gleam"), "list");
+    assert!(
+        out.ends_with("all list tests passed\n"),
+        "unexpected output:\n{out}"
+    );
+}
+
+#[test]
 fn hello_end_to_end() {
     if !cc_available() {
         eprintln!("skipping: no C compiler available");
