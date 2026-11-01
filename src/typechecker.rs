@@ -544,7 +544,9 @@ fn std_function(sub: &mut Subst, module: &str, name: &str) -> Option<(Type, Vec<
         // gleam/int.
         (_, _, _, true, _, _, "absolute_value") => Some((t_fn(vec![t_int()], t_int()), vec![Some("num".into())])),
         (_, _, _, true, _, _, "clamp") => Some((t_fn(int(3), t_int()), vec![None, Some("min".into()), Some("max".into())])),
-        (_, _, _, true, _, _, "compare") => Some((t_fn(vec![t_int(), t_int()], t_app("order/Order")), vec![None, None])),
+        (_, _, _, true, _, _, "compare") => {
+            Some((t_fn(vec![t_int(), t_int()], t_app("order/Order")), vec![None, Some("with".into())]))
+        }
         (_, _, _, true, _, _, "digits") => Some((
             t_fn(vec![t_int(), t_int()], t_result(t_list(t_int()), t_app("int/IntError"))),
             vec![Some("number".into()), Some("base".into())],

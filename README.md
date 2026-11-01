@@ -42,6 +42,26 @@ pub fn main() {
 }
 ```
 
+### Examples
+
+The `examples/` directory contains runnable demo programs, each covered by an
+end-to-end test in `tests/runtime.rs`:
+
+| File | Shows |
+|---|---|
+| `examples/basic.gleam` | core language features: functions, labels, `let`, `case` with guards, tuples, lists with spread, records, closures, pipelines, `Result` |
+| `examples/int.gleam` | the `gleam/int` module (conversions, parity, clamping, bases, digits) |
+| `examples/string.gleam` | the `gleam/string` module (case changes, trimming, splitting, slicing, predicates) |
+| `examples/list.gleam` | the `gleam/list` module (map/filter/fold, zip, sort, chunking) |
+
+Run one:
+
+```sh
+./target/debug/gleamc examples/basic.gleam -o /tmp/out
+cc -std=c11 -Wall -Wextra /tmp/out/main.c /tmp/out/gleam_runtime.c -o /tmp/prog
+/tmp/prog
+```
+
 ## How it works
 
 ```
@@ -87,6 +107,11 @@ src/
   runtime/
     gleam_runtime.h   GValue model + runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + stdlib function bodies
+examples/
+  basic.gleam     demo of core language features
+  int.gleam       demo of the gleam/int module
+  string.gleam    demo of the gleam/string module
+  list.gleam      demo of the gleam/list module
 tests/
   tour.rs         parser-level tests (no C involved)
   typecheck.rs    type checker tests: programs that must check, and ones that must fail

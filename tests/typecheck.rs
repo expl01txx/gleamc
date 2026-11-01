@@ -1,7 +1,7 @@
 //! Type checker tests: programs that must type check, and programs that must
 //! be rejected with a sensible error message.
 
-use gleam_to_c::{parse, typecheck_source};
+use gleamc::{parse, typecheck_source};
 
 fn ok(source: &str) {
     let module = parse(source).expect("should parse");

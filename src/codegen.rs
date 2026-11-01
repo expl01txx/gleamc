@@ -977,14 +977,14 @@ impl<'a> Compiler<'a> {
                     value = result;
                 }
                 Expr::Call(call) => {
-                    let mut args = vec![CallArg::Value(Expression::synthetic(Expr::Nil))];
-                    args.extend(call.args.clone());
-                    let fake = Call {
-                        fun: call.fun.clone(),
-                        args,
-                        fun_span: call.fun_span,
-                    };
-                    let values = self.eval_call_args(&fake.args[1..], &vec![None; fake.args.len() - 1], out)?;
+                    // Resolve labels like a direct call so labeled arguments
+                    // work in pipeline stages; the piped value occupies the
+                    // first slot, so skip it when matching labels.
+                    let labels = self
+                        .direct_function(&call.fun)
+                        .map(|(_, info)| info.labels)
+                        .unwrap_or_else(|| vec![None; call.args.len()]);
+                    let values = self.eval_call_args(&call.args, &labels[1.min(labels.len())..], out)?;
                     let function = self.gen_expr(&call.fun, out)?;
                     let mut all = vec![value.clone()];
                     all.extend(values.iter().cloned());

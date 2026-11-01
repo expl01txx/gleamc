@@ -19,6 +19,11 @@ src/
   runtime/
     gleam_runtime.h   GValue model + all runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + all stdlib function bodies
+examples/
+  basic.gleam     demo of core language features (covered by an e2e test)
+  int.gleam       demo of the gleam/int module
+  string.gleam    demo of the gleam/string module
+  list.gleam      demo of the gleam/list module
 tests/
   tour.rs         parser-level tests (no C involved)
   typecheck.rs    type checker tests: valid programs pass, invalid ones fail with a message
