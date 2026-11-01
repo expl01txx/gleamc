@@ -1227,7 +1227,17 @@ impl<'a> Checker<'a> {
         let kind = match &ty.kind {
             TypeDefKind::Record(variants) => {
                 for variant in variants {
-                    if self.env.constructors.insert(
+                    // A true duplicate is a second variant of the *same*
+                    // type. Constructors of other types may share a bare
+                    // name (e.g. `list.ContinueOrStop.Continue` vs a local
+                    // `Continue`); the local definition then shadows the
+                    // built-in in unqualified lookup, matching codegen.
+                    let is_duplicate = self.env.constructors.get(&variant.name)
+                        .is_some_and(|c| c.type_name == ty.name && c.type_module.is_none());
+                    if is_duplicate {
+                        return Err(self.error(format!("duplicate constructor `{}`", variant.name), ty.span));
+                    }
+                    self.env.constructors.insert(
                         variant.name.clone(),
                         Ctor {
                             type_name: ty.name.clone(),
@@ -1235,11 +1245,7 @@ impl<'a> Checker<'a> {
                             params: ty.params.clone(),
                             fields: variant.fields.clone(),
                         },
-                    )
-                    .is_some()
-                    {
-                        return Err(self.error(format!("duplicate constructor `{}`", variant.name), ty.span));
-                    }
+                    );
                 }
                 TypeKind::Bare
             }
@@ -2118,11 +2124,26 @@ impl<'a> Checker<'a> {
     // ------------------------------------------------------------------
 
     fn check_pattern(&mut self, pattern: &Pattern, subject: &Type, span: Span) -> Result<(), TypeCheckError> {
+        let mut bound = HashSet::new();
+        self.check_pattern_inner(pattern, subject, span, &mut bound)
+    }
+
+    /// `bound` tracks the names introduced by this pattern. Binding the same
+    /// name twice within one pattern is an error, while shadowing a variable
+    /// from an outer scope (e.g. `let x = f(x)`) is allowed and simply
+    /// overwrites the binding in the current scope.
+    fn check_pattern_inner(
+        &mut self,
+        pattern: &Pattern,
+        subject: &Type,
+        span: Span,
+        bound: &mut HashSet<String>,
+    ) -> Result<(), TypeCheckError> {
         let subject = self.sub.apply(subject);
         match pattern {
             Pattern::Var(name) => {
                 if !name.starts_with('_') {
-                    self.bind_var(name, subject, span)?;
+                    self.bind_pattern_var(name, subject, span, bound)?;
                 }
                 Ok(())
             }
@@ -2138,7 +2159,7 @@ impl<'a> Checker<'a> {
                 self.pattern_literal(&subject, &t_string(), span)?;
                 if let Pattern::Var(name) = &**rest {
                     if !name.starts_with('_') {
-                        self.bind_var(name, t_string(), span)?;
+                        self.bind_pattern_var(name, t_string(), span, bound)?;
                     }
                 }
                 Ok(())
@@ -2177,7 +2198,7 @@ impl<'a> Checker<'a> {
                                 .position(|field| field.label.as_deref().or(field.name.as_deref()) == Some(label.as_str()))
                                 .ok_or_else(|| self.error(format!("unknown field `{label}` in `{}`", reference.name), span))?;
                             let ty = self.resolve_annotation(&ctor.fields[index].type_annotation, &param_env, 0)?;
-                            self.check_pattern(pattern, &ty, span)?;
+                            self.check_pattern_inner(pattern, &ty, span, bound)?;
                         }
                         PatternArg::Unnamed(pattern) => {
                             if position >= ctor.fields.len() {
@@ -2187,7 +2208,7 @@ impl<'a> Checker<'a> {
                                 ));
                             }
                             let ty = self.resolve_annotation(&ctor.fields[position].type_annotation, &param_env, 0)?;
-                            self.check_pattern(pattern, &ty, span)?;
+                            self.check_pattern_inner(pattern, &ty, span, bound)?;
                             position += 1;
                         }
                         PatternArg::DiscardRest => {}
@@ -2204,10 +2225,10 @@ impl<'a> Checker<'a> {
                     }
                 };
                 for element in elements {
-                    self.check_pattern(element, &elem, span)?;
+                    self.check_pattern_inner(element, &elem, span, bound)?;
                 }
                 if let Some(rest) = rest {
-                    self.check_pattern(rest, &t_list(elem), span)?;
+                    self.check_pattern_inner(rest, &t_list(elem), span, bound)?;
                 }
                 Ok(())
             }
@@ -2225,7 +2246,7 @@ impl<'a> Checker<'a> {
                         ));
                     }
                     for (pattern, ty) in elems.iter().zip(subject_elems.iter()) {
-                        self.check_pattern(pattern, ty, span)?;
+                        self.check_pattern_inner(pattern, ty, span, bound)?;
                     }
                     Ok(())
                 }
@@ -2238,15 +2259,15 @@ impl<'a> Checker<'a> {
                 }
                 for segment in &bit_array.segments {
                     let ty = self.sub.fresh();
-                    self.check_pattern(&segment.value, &ty, span)?;
+                    self.check_pattern_inner(&segment.value, &ty, span, bound)?;
                 }
                 Ok(())
             }
 
             Pattern::Alias { pattern, name } => {
-                self.check_pattern(pattern, &subject, span)?;
+                self.check_pattern_inner(pattern, &subject, span, bound)?;
                 if !name.starts_with('_') {
-                    self.bind_var(name, subject, span)?;
+                    self.bind_pattern_var(name, subject, span, bound)?;
                 }
                 Ok(())
             }
@@ -2258,7 +2279,8 @@ impl<'a> Checker<'a> {
                 // The first alternative binds in the current scope; the rest
                 // must bind exactly the same variables with compatible types.
                 let base_len = self.scopes.last().expect("scope open").len();
-                self.check_pattern(&alternatives[0], &subject, span)?;
+                let mut first_bound = HashSet::new();
+                self.check_pattern_inner(&alternatives[0], &subject, span, &mut first_bound)?;
                 let scope = self.scopes.last().expect("scope open");
                 let mut expected: Vec<(String, Type)> =
                     scope.iter().skip(base_len).map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -2266,7 +2288,8 @@ impl<'a> Checker<'a> {
 
                 for alternative in &alternatives[1..] {
                     self.scopes.push(HashMap::new());
-                    self.check_pattern(alternative, &subject, span)?;
+                    let mut alt_bound = HashSet::new();
+                    self.check_pattern_inner(alternative, &subject, span, &mut alt_bound)?;
                     let mut actual: Vec<(String, Type)> =
                         self.scopes.last().expect("scope open").iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     self.scopes.pop();
@@ -2287,6 +2310,23 @@ impl<'a> Checker<'a> {
                 Ok(())
             }
         }
+    }
+
+    fn bind_pattern_var(
+        &mut self,
+        name: &str,
+        ty: Type,
+        span: Span,
+        bound: &mut HashSet<String>,
+    ) -> Result<(), TypeCheckError> {
+        if !bound.insert(name.into()) {
+            return Err(self.error(format!("variable `{name}` is already bound in this scope"), span));
+        }
+        self.scopes
+            .last_mut()
+            .expect("a scope is always open")
+            .insert(name.into(), ty);
+        Ok(())
     }
 
     fn pattern_literal(&mut self, subject: &Type, literal: &Type, span: Span) -> Result<(), TypeCheckError> {
