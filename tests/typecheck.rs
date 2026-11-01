@@ -269,6 +269,48 @@ fn generic_types() {
     "#);
 }
 
+#[test]
+fn constant_constructor_fields() {
+    ok(r#"
+        type Point {
+          Point(x: Int, y: Int)
+        }
+
+        const origin = Point(x: 1, y: 2)
+
+        pub fn main() -> Int {
+          origin.x + origin.y
+        }
+    "#);
+}
+
+#[test]
+fn list_map_changes_element_type() {
+    // The closure takes the element type and may return a different one.
+    ok(r#"
+        pub fn main() -> List(String) {
+          list.map([1, 2], fn(x) { int.to_string(x) })
+        }
+    "#);
+}
+
+#[test]
+fn constant_constructor_generic() {
+    ok(r#"
+        type Wrapper(a) {
+          Wrap(inner: a)
+        }
+
+        const w = Wrap(1)
+
+        pub fn main() -> Int {
+          case w {
+            Wrap(i) -> i
+          }
+        }
+    "#);
+}
+
 // ---------------------------------------------------------------------------
 // Negative tests
 // ---------------------------------------------------------------------------
@@ -389,6 +431,66 @@ fn case_branch_type_mismatch() {
 #[test]
 fn binary_operator_non_numeric() {
     err("pub fn main() -> Bool {\n  True + False\n}", "expects Int operands");
+}
+
+#[test]
+fn constant_constructor_field_type_mismatch() {
+    err(
+        r#"
+            type Point {
+              Point(x: Int, y: Int)
+            }
+
+            const bad = Point(x: "one", y: 2)
+
+            pub fn main() -> Int { 1 }
+        "#,
+        "type mismatch",
+    );
+}
+
+#[test]
+fn constant_constructor_arity() {
+    err(
+        r#"
+            type Point {
+              Point(x: Int, y: Int)
+            }
+
+            const bad = Point(1)
+
+            pub fn main() -> Int { 1 }
+        "#,
+        "expects 2 field(s)",
+    );
+}
+
+#[test]
+fn list_map_checks_element_type() {
+    err(
+        r#"
+            pub fn main() -> List(Int) {
+              list.map(["a"], fn(x) { x + 1 })
+            }
+        "#,
+        "type mismatch",
+    );
+}
+
+#[test]
+fn constant_constructor_bad_label() {
+    err(
+        r#"
+            type Point {
+              Point(x: Int, y: Int)
+            }
+
+            const bad = Point(z: 1, z: 2)
+
+            pub fn main() -> Int { 1 }
+        "#,
+        "no field labeled `z`",
+    );
 }
 
 #[test]

@@ -240,7 +240,8 @@ pub enum ConstValue {
     Nil,
     /// A reference to another constant in the same module.
     Var(String),
-    Constructor(ConstructorRef),
+    /// A record constructor with its arguments, e.g. `Point(x: 1, y: 2)`.
+    Constructor(ConstructorRef, Vec<ConstArg>),
     List {
         elements: Vec<ConstValue>,
         /// `..` spread of another constant list.

@@ -147,6 +147,19 @@ fn cli_module_end_to_end() {
 }
 
 #[test]
+fn const_constructor_end_to_end() {
+    if !cc_available() {
+        eprintln!("skipping: no C compiler available");
+        return;
+    }
+    let out = run_gleam(include_str!("const_test.gleam"), "const");
+    assert!(
+        out.ends_with("all const tests passed\n"),
+        "unexpected output:\n{out}"
+    );
+}
+
+#[test]
 fn hello_end_to_end() {
     if !cc_available() {
         eprintln!("skipping: no C compiler available");

@@ -435,15 +435,29 @@ impl<'a> Compiler<'a> {
                     values.join(", ")
                 ))
             }
-            ConstValue::Constructor(reference) => {
-                let info = self.constructor(reference, span)?.clone();
-                if !info.fields.is_empty() {
+            ConstValue::Constructor(reference, args) => {
+                let info = self.constructor(reference, span)?;
+                if args.len() != info.fields.len() {
                     return Err(CodegenError::new(
-                        "constructor constants with fields are not supported by this AST",
+                        format!(
+                            "`{}` expects {} field(s), but the constant has {}",
+                            reference.name,
+                            info.fields.len(),
+                            args.len()
+                        ),
                         span,
                     ));
                 }
-                Ok(format!("g_record({}, 0, NULL)", c_string(&reference.name)))
+                let values = args
+                    .iter()
+                    .map(|arg| self.compile_constant(&arg.value, span))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(format!(
+                    "g_record({}, {}, (GValue[]){{{}}})",
+                    c_string(&reference.name),
+                    values.len(),
+                    values.join(", ")
+                ))
             }
             ConstValue::BitArray(_) => Err(CodegenError::new(
                 "constant bit arrays are not supported by the C backend",

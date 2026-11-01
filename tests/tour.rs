@@ -485,9 +485,45 @@ const color = Rgb(r: 255, g: 128, b: 0)
     );
     match &m.definitions[1] {
         Definition::Constant(c) => match &c.value {
-            ConstValue::Constructor(ref_) => {
+            ConstValue::Constructor(ref_, args) => {
                 assert_eq!(ref_.name, "Rgb");
                 assert_eq!(ref_.module, None);
+                assert_eq!(args.len(), 3);
+                // The arguments are preserved, not discarded.
+                assert_eq!(args[0].label.as_deref(), Some("r"));
+                assert_eq!(
+                    *args[0].value,
+                    ConstValue::Int(IntValue { raw: "255".into() })
+                );
+                assert_eq!(args[1].label.as_deref(), Some("g"));
+                assert_eq!(args[2].label.as_deref(), Some("b"));
+            }
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn constant_constructor_unlabeled_and_nested() {
+    let m = ok(
+        r#"
+type Pair {
+  Pair(Int, String)
+}
+
+const inner = Pair(1, "one")
+const outer = [inner, inner]
+"#,
+    );
+    // The constructor arguments are positional and unlabelled.
+    match &m.definitions[1] {
+        Definition::Constant(c) => match &c.value {
+            ConstValue::Constructor(ref_, args) => {
+                assert_eq!(ref_.name, "Pair");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].label, None);
+                assert_eq!(args[1].label, None);
             }
             other => panic!("{other:?}"),
         },

@@ -814,8 +814,10 @@ fn std_function(sub: &mut Subst, module: &str, name: &str) -> Option<(Type, Vec<
         (_, _, _, _, true, _, "map") => {
             let a = sub.fresh();
             let b = sub.fresh();
+            // The closure must take the list element type (`a`) and may
+            // return a new type (`b`), matching `gleam/list.map`.
             Some((
-                t_fn(vec![t_list(a.clone()), t_fn(vec![b.clone()], b.clone())], t_list(b.clone())),
+                t_fn(vec![t_list(a.clone()), t_fn(vec![a], b.clone())], t_list(b)),
                 vec![Some("list".into()), Some("with".into())],
             ))
         }
@@ -1531,14 +1533,43 @@ impl<'a> Checker<'a> {
                 .get(name)
                 .map(|ty| self.sub.apply(ty))
                 .ok_or_else(|| self.error(format!("unknown constant `{name}`"), span)),
-            ConstValue::Constructor(reference) => {
+            ConstValue::Constructor(reference, args) => {
                 let ctor = self
                     .env
                     .constructors
                     .get(&reference.name)
                     .cloned()
                     .ok_or_else(|| self.error(format!("unknown constructor `{}`", reference.name), span))?;
-                Ok(self.ctor_record_type(&ctor))
+                if args.len() != ctor.fields.len() {
+                    return Err(self.error(
+                        format!(
+                            "`{}` expects {} field(s), but the constant has {}",
+                            reference.name,
+                            ctor.fields.len(),
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+                let record = self.ctor_record_type(&ctor);
+                for (index, arg) in args.iter().enumerate() {
+                    if let Some(label) = &arg.label {
+                        let expected = ctor.fields[index]
+                            .label
+                            .as_deref()
+                            .or(ctor.fields[index].name.as_deref());
+                        if expected != Some(label.as_str()) {
+                            return Err(self.error(
+                                format!("no field labeled `{label}` in `{}`", reference.name),
+                                span,
+                            ));
+                        }
+                    }
+                    let ty = self.field_type(&ctor, index)?;
+                    let value_ty = self.const_value_type(&arg.value, span)?;
+                    self.unify_with(&ty, &value_ty, span)?;
+                }
+                Ok(record)
             }
             ConstValue::List { elements, spread } => {
                 let elem = self.sub.fresh();

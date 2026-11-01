@@ -674,7 +674,10 @@ impl Parser {
                 break;
             }
         }
-        Ok(ConstValue::Constructor(ConstructorRef { module, name }))
+        Ok(ConstValue::Constructor(
+            ConstructorRef { module, name },
+            args,
+        ))
     }
 
     fn parse_const_list(&mut self) -> Result<ConstValue, ParseError> {
