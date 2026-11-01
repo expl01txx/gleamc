@@ -189,6 +189,23 @@ struct Compiler<'a> {
     scopes: Vec<Scope>,
     counter: usize,
     extra_functions: String,
+    /// C name of the function currently being compiled, if any.
+    current_fn: Option<String>,
+    /// True while compiling an expression in tail position inside a
+    /// function that is being compiled with tail-call optimization.
+    tail_mode: bool,
+    /// C names of the current function's parameter bindings (TCO only).
+    param_locals: Vec<String>,
+    /// Case subjects (one vec per enclosing case) that are still live and
+    /// must be released before a tail jump. TCO only.
+    live_case_subjects: Vec<Vec<String>>,
+}
+
+/// Outcome of compiling an expression in tail position: either a value was
+/// produced, or the code path ends in a tail jump (and never falls through).
+enum TailOutcome {
+    Jumped,
+    Value(String),
 }
 
 impl<'a> Compiler<'a> {
@@ -287,6 +304,10 @@ impl<'a> Compiler<'a> {
             visible: HashMap::new(),
             scopes: Vec::new(),
             counter: 0,
+            current_fn: None,
+            tail_mode: false,
+            param_locals: Vec::new(),
+            live_case_subjects: Vec::new(),
             extra_functions: String::new(),
         })
     }
@@ -421,15 +442,59 @@ impl<'a> Compiler<'a> {
             let name = self.temp();
             body.push_str(&format!("  GValue {name} = g_retain(args[{index}]);\n"));
             self.visible.insert(arg.name.clone(), name.clone());
+            self.param_locals.push(name.clone());
             self.scopes.last_mut().unwrap().locals.push(name);
         }
-        let result = self.gen_expr(&function.body, &mut body)?;
-        body.push_str(&format!("  GValue gleam_return = {result};\n"));
-        self.release_scope(&mut body);
-        body.push_str("  return gleam_return;\n}\n\n");
+        if Self::has_tail_self_call(&function.body, &function.name) {
+            // Tail-call optimization: the body is compiled inside an infinite
+            // loop and every direct self-recursive call in tail position
+            // becomes a jump back to the top of the loop (rebinding the
+            // parameters) instead of a nested C call. Deep recursion then
+            // uses constant stack space.
+            body.push_str("  for (;;) {\n    gleam_top:\n    {\n");
+            self.current_fn = Some(info.c_name.clone());
+            self.tail_mode = true;
+            let outcome = self.gen_expr_tail(&function.body, &mut body)?;
+            self.tail_mode = false;
+            self.current_fn = None;
+            match outcome {
+                TailOutcome::Value(result) => {
+                    body.push_str(&format!("      GValue gleam_return = {result};\n"));
+                }
+                // Unreachable: every path ends in a tail jump.
+                TailOutcome::Jumped => {
+                    body.push_str("      GValue gleam_return = g_nil();\n");
+                }
+            }
+            self.release_scope(&mut body);
+            body.push_str("      return gleam_return;\n    }\n  }\n}\n\n");
+        } else {
+            let result = self.gen_expr(&function.body, &mut body)?;
+            body.push_str(&format!("  GValue gleam_return = {result};\n"));
+            self.release_scope(&mut body);
+            body.push_str("  return gleam_return;\n}\n\n");
+        }
+        self.param_locals.clear();
         self.visible.clear();
         self.scopes.clear();
         Ok(body)
+    }
+
+    /// True if `expr` contains a direct self-recursive call in tail position
+    /// (through blocks and case clauses). Such functions are compiled with
+    /// tail-call optimization.
+    fn has_tail_self_call(expr: &Expression, name: &str) -> bool {
+        match &expr.expr {
+            Expr::Call(call) => matches!(&call.fun.expr, Expr::Var(fun) if fun == name),
+            Expr::Block(statements) => statements
+                .last()
+                .is_some_and(|last| Self::has_tail_self_call(last, name)),
+            Expr::Case(case) => case
+                .clauses
+                .iter()
+                .any(|clause| Self::has_tail_self_call(&clause.expression, name)),
+            _ => false,
+        }
     }
 
     fn compile_constant(&mut self, value: &ConstValue, span: Span) -> Result<String, CodegenError> {
@@ -724,6 +789,126 @@ impl<'a> Compiler<'a> {
             ));
         }
         result
+    }
+
+    /// Compile an expression in tail position. A direct self-recursive call
+    /// becomes a tail jump (rebinding the parameters and `goto`-ing the top
+    /// of the function loop) instead of a nested C call; anything else is
+    /// compiled as usual and yields a value.
+    fn gen_expr_tail(
+        &mut self,
+        expression: &Expression,
+        out: &mut String,
+    ) -> Result<TailOutcome, CodegenError> {
+        match &expression.expr {
+            Expr::Block(statements) => {
+                let last = statements.len() - 1;
+                for statement in &statements[..last] {
+                    let value = self.gen_expr(statement, out)?;
+                    out.push_str(&format!("  g_release({value});\n"));
+                }
+                self.gen_expr_tail(&statements[last], out)
+            }
+            Expr::Case(case) => self.gen_case_tail(case, expression.span, out),
+            Expr::Call(call) => {
+                if let Some((name, info)) = self.direct_function(&call.fun) {
+                    if self.current_fn.as_deref() == Some(name.as_str()) && self.tail_mode {
+                        let values = self.eval_call_args(&call.args, &info.labels, out)?;
+                        // Release every tracked reference live at this point:
+                        // the function parameters, pattern bindings of
+                        // enclosing clauses, closure captures, and the
+                        // subjects of enclosing cases. The loop re-entry
+                        // rebinds them from the new arguments.
+                        for scope in &self.scopes {
+                            for local in &scope.locals {
+                                out.push_str(&format!("  g_release({local});\n"));
+                            }
+                        }
+                        for subjects in &self.live_case_subjects {
+                            for subject in subjects {
+                                out.push_str(&format!("  g_release({subject});\n"));
+                            }
+                        }
+                        // Transfer ownership of the new arguments to the
+                        // parameter bindings (plain aliasing: no retain and
+                        // no release — the parameters now own the references).
+                        for (parameter, value) in self.param_locals.iter().zip(&values) {
+                            out.push_str(&format!("  {parameter} = {value};\n"));
+                        }
+                        out.push_str("  goto gleam_top;\n");
+                        return Ok(TailOutcome::Jumped);
+                    }
+                }
+                let value = self.gen_expr(expression, out)?;
+                Ok(TailOutcome::Value(value))
+            }
+            _ => {
+                let value = self.gen_expr(expression, out)?;
+                Ok(TailOutcome::Value(value))
+            }
+        }
+    }
+
+    /// Like `gen_case`, but each clause body is compiled in tail position,
+    /// so clauses ending in a direct self-recursive call become tail jumps.
+    fn gen_case_tail(
+        &mut self,
+        case: &Case,
+        span: Span,
+        out: &mut String,
+    ) -> Result<TailOutcome, CodegenError> {
+        let subjects = self.gen_values(&case.subjects, out)?;
+        let result = self.temp();
+        out.push_str(&format!("  GValue {result};\n  int {result}_matched = 0;\n"));
+        self.live_case_subjects.push(subjects.clone());
+        for clause in &case.clauses {
+            let saved_visible = self.visible.clone();
+            out.push_str(&format!("  if (!{result}_matched) {{\n"));
+            self.scopes.push(Scope::default());
+            let mut conditions = Vec::new();
+            for (pattern, subject) in clause.patterns.iter().zip(&subjects) {
+                conditions.push(self.pattern_condition(pattern, subject, span)?);
+            }
+            let condition = if conditions.is_empty() {
+                "1".into()
+            } else {
+                conditions.join(" && ")
+            };
+            out.push_str(&format!("    if ({condition}) {{\n"));
+            for (pattern, subject) in clause.patterns.iter().zip(&subjects) {
+                self.bind_pattern(pattern, subject, out)?;
+            }
+            if let Some(guard) = &clause.guard {
+                let guard = self.gen_guard(guard, out)?;
+                out.push_str(&format!(
+                    "      if (({guard}).tag != G_BOOL) g_type_error(\"Bool\", {guard}, __FILE__, __LINE__);\n      if (({guard}).as.boolean) {{\n      g_release({guard});\n"
+                ));
+            }
+            match self.gen_expr_tail(&clause.expression, out)? {
+                // The clause ends in a tail jump and never falls through.
+                TailOutcome::Jumped => {}
+                TailOutcome::Value(value) => {
+                    // Aliasing the value into the case result transfers
+                    // ownership of its reference (the temporary name is
+                    // never used again).
+                    out.push_str(&format!("      {result} = {value};\n      {result}_matched = 1;\n"));
+                }
+            }
+            if clause.guard.is_some() {
+                out.push_str("      }\n");
+            }
+            self.release_scope(out);
+            out.push_str("    }\n  }\n");
+            self.visible = saved_visible;
+        }
+        self.live_case_subjects.pop();
+        out.push_str(&format!(
+            "  if (!{result}_matched) g_panic(\"no case clause matched\", __FILE__, __LINE__);\n"
+        ));
+        for subject in &subjects {
+            out.push_str(&format!("  g_release({subject});\n"));
+        }
+        Ok(TailOutcome::Value(result))
     }
 
     fn gen_block(&mut self, statements: &[Expression], out: &mut String) -> Result<String, CodegenError> {
@@ -1077,6 +1262,8 @@ impl<'a> Compiler<'a> {
                 ));
             }
             let value = self.gen_expr(&clause.expression, out)?;
+            // Aliasing the value into the case result transfers ownership
+            // of its reference (the temporary name is never used again).
             out.push_str(&format!("      {result} = {value};\n      {result}_matched = 1;\n"));
             if clause.guard.is_some() {
                 out.push_str("      }\n");

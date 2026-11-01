@@ -333,6 +333,33 @@ fn list_example_end_to_end() {
 }
 
 #[test]
+fn tail_recursion_end_to_end() {
+    if !cc_available() {
+        eprintln!("skipping: no C compiler available");
+        return;
+    }
+    // 100,000 levels of recursion would overflow the C stack without
+    // tail-call optimization; with it, this runs in constant stack space.
+    let src = r#"
+import gleam/io
+import gleam/int
+
+fn sum(n: Int, acc: Int) -> Int {
+  case n {
+    0 -> acc
+    _ -> sum(n - 1, acc + n)
+  }
+}
+
+pub fn main() {
+  io.println(int.to_string(sum(100_000, 0)))
+}
+"#;
+    let out = run_gleam(src, "tail-recursion");
+    assert_eq!(out, "5000050000\n");
+}
+
+#[test]
 fn hello_end_to_end() {
     if !cc_available() {
         eprintln!("skipping: no C compiler available");
