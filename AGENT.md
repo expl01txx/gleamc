@@ -16,7 +16,7 @@ src/
   parser.rs       recursive-descent parser producing a Module
   typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; also embeds the runtime via include_str!
-  main.rs         CLI: `gleamc <file.gleam> [-o <dir>] [-c]`; auto-compiles with cc
+  main.rs         CLI: `gleamc <file.gleam> [-o <dir>] [-c] [-release]`; auto-compiles with cc
   runtime/
     gleam_runtime.h   GValue model + all runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + all stdlib function bodies
@@ -38,9 +38,10 @@ gleam_std_*.html  vendored stdlib docs (string, int, list, ...)
 
 ```sh
 cargo build
-./target/debug/gleamc tests/hello.gleam      # -> ./program, gleam-out removed
+./target/debug/gleamc tests/hello.gleam            # -> ./program, gleam-out removed
 ./program
-./target/debug/gleamc tests/hello.gleam -c   # -> gleam-out/hello.c (single file)
+./target/debug/gleamc tests/hello.gleam -release   # optimized: -O3 -flto -gc-sections
+./target/debug/gleamc tests/hello.gleam -c         # -> gleam-out/hello.c (single file)
 cc -std=c11 -Wall -Wextra gleam-out/hello.c -o prog
 prog
 cargo test    # parser tests + e2e runtime tests (skipped if no cc)
@@ -49,6 +50,8 @@ cargo test    # parser tests + e2e runtime tests (skipped if no cc)
 The default CLI mode stages the C project in `gleam-out` (or `-o <dir>`),
 compiles it with `cc -std=c11 -Wall -Wextra` into `./program`, and removes
 the staging directory on success (on failure the C files are kept).
+`-release` adds `-O3 -flto -ffunction-sections -fdata-sections
+-Wl,--gc-sections -DNDEBUG` for an optimized build.
 `-c` writes one self-contained C file — `<stem>.c` in the output directory —
 with the runtime header and source embedded, buildable with a single `cc`
 invocation.

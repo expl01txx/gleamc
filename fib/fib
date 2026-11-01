@@ -1,0 +1,37 @@
+puts Enter number:
+read
+set 2
+get 2
+jle -1 35
+seta 0
+set 0
+seta 1
+set 1
+get 2
+cmp 0 31
+get 1
+set 3
+get 0
+set 4
+cmp 0 23
+get 3
+inc
+set 3
+get 4
+dec
+set 4
+jmp 15
+get 1
+set 0
+get 3
+set 1
+get 2
+dec
+set 2
+jmp 9
+puts fib(n) =
+get 0
+puti
+end
+puts error: n must be >= 0
+end

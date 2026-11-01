@@ -26,6 +26,12 @@ cargo build
 
 By default `gleamc` generates the C files in a staging directory (`gleam-out`), compiles them with `cc -std=c11 -Wall -Wextra` into `./program`, and removes the staging directory again. If the compile fails, the C files are kept so you can fix and build them manually.
 
+Pass `-release` to build an optimized binary (`-O3 -flto -ffunction-sections -fdata-sections -Wl,--gc-sections -DNDEBUG`):
+
+```sh
+./target/debug/gleamc tests/hello.gleam -release
+```
+
 To emit C instead of a binary, pass `-c`: this writes a single self-contained C file (runtime embedded) that compiles with one command:
 
 ```sh
@@ -106,7 +112,7 @@ src/
   parser.rs       recursive-descent parser producing a Module
   typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; embeds the runtime via include_str!
-  main.rs         CLI: gleamc <file.gleam> [-o <dir>] [-c]; auto-compiles with cc
+  main.rs         CLI: gleamc <file.gleam> [-o <dir>] [-c] [-release]; auto-compiles with cc
   runtime/
     gleam_runtime.h   GValue model + runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + stdlib function bodies

@@ -14,6 +14,7 @@ after a successful compile.
 options:
   -o <dir>   staging/output directory (default: gleam-out)
   -c         write a single self-contained C file and skip compilation
+  -release   compile with optimizations (-O3, LTO, section garbage collection)
 ";
 
 fn main() -> ExitCode {
@@ -24,6 +25,7 @@ fn main() -> ExitCode {
     };
     let mut output = PathBuf::from("gleam-out");
     let mut codegen_only = false;
+    let mut release = false;
     let mut pending_output = false;
     for arg in args {
         if pending_output {
@@ -34,6 +36,7 @@ fn main() -> ExitCode {
         match arg.as_str() {
             "-o" => pending_output = true,
             "-c" => codegen_only = true,
+            "-release" => release = true,
             _ => {
                 eprint!("{USAGE}");
                 return ExitCode::from(2);
@@ -96,9 +99,21 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let mut cc_args: Vec<&str> = vec!["-std=c11", "-Wall", "-Wextra"];
+    if release {
+        cc_args.extend([
+            "-O3",
+            "-flto",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wl,--gc-sections",
+            "-DNDEBUG",
+        ]);
+    }
+
     let binary = PathBuf::from("program");
     let compile = Command::new("cc")
-        .args(["-std=c11", "-Wall", "-Wextra"])
+        .args(&cc_args)
         .arg(output.join("main.c"))
         .arg(output.join("gleam_runtime.c"))
         .arg("-o")
@@ -109,6 +124,13 @@ fn main() -> ExitCode {
         Ok(result) if result.status.success() => {
             if let Err(error) = fs::remove_dir_all(&output) {
                 eprintln!("note: could not remove {}: {error}", output.display());
+            } else if release {
+                println!(
+                    "compiled {} -> {} (release build, removed {})",
+                    input,
+                    binary.display(),
+                    output.display()
+                );
             } else {
                 println!(
                     "compiled {} -> {} (removed {})",
