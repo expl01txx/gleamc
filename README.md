@@ -20,7 +20,7 @@ No external crates — the whole project is `std`-only Rust plus two hand-writte
 cargo build
 
 # 2. Compile a Gleam program to C
-./target/debug/gleam-parser tests/hello.gleam -o /tmp/out
+./target/debug/gleam-to-c tests/hello.gleam -o /tmp/out
 
 # 3. Build the generated C project with any C11 compiler
 cc -std=c11 -Wall -Wextra /tmp/out/main.c /tmp/out/gleam_runtime.c -o /tmp/prog
@@ -64,7 +64,8 @@ carry source spans and, when the source text is available, line/column numbers.
 
 | Module | Coverage |
 |---|---|
-| `gleam/io` | `print`, `println`, `debug`, `read_line` |
+| `gleam/io` | `print`, `println`, `debug`, `read_line`, `readln` |
+| `gleam/cli` | `args` (command-line arguments as a list of strings) |
 | `gleam/fs` | `read`, `write`, `append`, `remove`, `is_file`, `is_directory`, `create_directory`, `list_directory` |
 | `gleam/string` | 31 functions (grapheme/UTF functions excluded) |
 | `gleam/int` | all 21 functions |
@@ -82,7 +83,7 @@ src/
   parser.rs       recursive-descent parser producing a Module
   typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; embeds the runtime via include_str!
-  main.rs         CLI: gleam-parser <file.gleam> -o <dir>
+  main.rs         CLI: gleam-to-c <file.gleam> -o <dir>
   runtime/
     gleam_runtime.h   GValue model + runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + stdlib function bodies

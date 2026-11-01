@@ -310,11 +310,12 @@ impl<'a> Compiler<'a> {
         output.push_str(&definitions);
         if has_main {
             output.push_str(
-                "int main(void) {\n  GValue gleam_result;\n",
+                "int main(int argc, char **argv) {\n  GValue gleam_result;\n",
             );
             if !self.constants.is_empty() {
                 output.push_str("  gleam_init_constants();\n");
             }
+            output.push_str("  gleam_init_cli_args(argc, argv);\n");
             output.push_str(
                 "  gleam_result = gleam_fn_main(NULL, NULL, 0);\n  g_release(gleam_result);\n",
             );
@@ -1422,283 +1423,288 @@ fn std_function(
     let string = matches!(module, "gleam/string" | "string");
     let int = matches!(module, "gleam/int" | "int");
     let list = matches!(module, "gleam/list" | "list");
-    match (io, fs, string, int, list, name) {
-        (true, _, _, _, _, "print") => Some(("gleam_io_print", 1, &[Some("message")])),
-        (true, _, _, _, _, "println") => Some(("gleam_io_println", 1, &[Some("message")])),
-        (true, _, _, _, _, "debug") => Some(("gleam_io_debug", 1, &[Some("value")])),
-        (true, _, _, _, _, "read_line") => Some(("gleam_io_read_line", 0, &[])),
-        (_, true, _, _, _, "read" | "read_file") => Some(("gleam_fs_read", 1, &[Some("path")])),
-        (_, true, _, _, _, "write" | "write_file") => {
+    let cli = matches!(module, "gleam/cli" | "cli");
+    match (io, fs, string, int, list, cli, name) {
+        (true, _, _, _, _, _, "print") => Some(("gleam_io_print", 1, &[Some("message")])),
+        (true, _, _, _, _, _, "println") => Some(("gleam_io_println", 1, &[Some("message")])),
+        (true, _, _, _, _, _, "debug") => Some(("gleam_io_debug", 1, &[Some("value")])),
+        (true, _, _, _, _, _, "read_line" | "readln") => {
+            Some(("gleam_io_read_line", 0, &[]))
+        }
+        (_, true, _, _, _, _, "read" | "read_file") => Some(("gleam_fs_read", 1, &[Some("path")])),
+        (_, true, _, _, _, _, "write" | "write_file") => {
             Some(("gleam_fs_write", 2, &[Some("path"), Some("contents")]))
         }
-        (_, true, _, _, _, "append" | "append_file") => {
+        (_, true, _, _, _, _, "append" | "append_file") => {
             Some(("gleam_fs_append", 2, &[Some("path"), Some("contents")]))
         }
-        (_, true, _, _, _, "remove" | "delete") => Some(("gleam_fs_remove", 1, &[Some("path")])),
-        (_, true, _, _, _, "is_file") => Some(("gleam_fs_is_file", 1, &[Some("path")])),
-        (_, true, _, _, _, "is_directory") => Some(("gleam_fs_is_directory", 1, &[Some("path")])),
-        (_, true, _, _, _, "create_directory") => {
+        (_, true, _, _, _, _, "remove" | "delete") => Some(("gleam_fs_remove", 1, &[Some("path")])),
+        (_, true, _, _, _, _, "is_file") => Some(("gleam_fs_is_file", 1, &[Some("path")])),
+        (_, true, _, _, _, _, "is_directory") => Some(("gleam_fs_is_directory", 1, &[Some("path")])),
+        (_, true, _, _, _, _, "create_directory") => {
             Some(("gleam_fs_create_directory", 1, &[Some("path")]))
         }
-        (_, true, _, _, _, "list_directory" | "list") => {
+        (_, true, _, _, _, _, "list_directory" | "list") => {
             Some(("gleam_fs_list_directory", 1, &[Some("path")]))
         }
         // gleam/string (grapheme and UTF code point functions excluded).
-        (_, _, true, _, _, "append") => {
+        (_, _, true, _, _, _, "append") => {
             Some(("gleam_string_append", 2, &[Some("to"), Some("suffix")]))
         }
-        (_, _, true, _, _, "byte_size") => Some(("gleam_string_byte_size", 1, &[Some("string")])),
-        (_, _, true, _, _, "capitalise") => {
+        (_, _, true, _, _, _, "byte_size") => Some(("gleam_string_byte_size", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "capitalise") => {
             Some(("gleam_string_capitalise", 1, &[Some("string")]))
         }
-        (_, _, true, _, _, "compare") => Some(("gleam_string_compare", 2, &[None, None])),
-        (_, _, true, _, _, "concat") => Some(("gleam_string_concat", 1, &[Some("strings")])),
-        (_, _, true, _, _, "contains") => {
+        (_, _, true, _, _, _, "compare") => Some(("gleam_string_compare", 2, &[None, None])),
+        (_, _, true, _, _, _, "concat") => Some(("gleam_string_concat", 1, &[Some("strings")])),
+        (_, _, true, _, _, _, "contains") => {
             Some(("gleam_string_contains", 2, &[Some("does"), Some("contain")]))
         }
-        (_, _, true, _, _, "crop") => Some(("gleam_string_crop", 2, &[Some("from"), Some("before")])),
-        (_, _, true, _, _, "ends_with") => Some(("gleam_string_ends_with", 2, &[None, None])),
-        (_, _, true, _, _, "first") => Some(("gleam_string_first", 1, &[Some("string")])),
-        (_, _, true, _, _, "inspect") => Some(("gleam_string_inspect", 1, &[Some("term")])),
-        (_, _, true, _, _, "is_empty") => Some(("gleam_string_is_empty", 1, &[Some("str")])),
-        (_, _, true, _, _, "join") => {
+        (_, _, true, _, _, _, "crop") => Some(("gleam_string_crop", 2, &[Some("from"), Some("before")])),
+        (_, _, true, _, _, _, "ends_with") => Some(("gleam_string_ends_with", 2, &[None, None])),
+        (_, _, true, _, _, _, "first") => Some(("gleam_string_first", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "inspect") => Some(("gleam_string_inspect", 1, &[Some("term")])),
+        (_, _, true, _, _, _, "is_empty") => Some(("gleam_string_is_empty", 1, &[Some("str")])),
+        (_, _, true, _, _, _, "join") => {
             Some(("gleam_string_join", 2, &[Some("strings"), Some("with")]))
         }
-        (_, _, true, _, _, "last") => Some(("gleam_string_last", 1, &[Some("string")])),
-        (_, _, true, _, _, "length") => Some(("gleam_string_length", 1, &[Some("string")])),
-        (_, _, true, _, _, "lowercase") => Some(("gleam_string_lowercase", 1, &[Some("string")])),
-        (_, _, true, _, _, "pad_end") => {
+        (_, _, true, _, _, _, "last") => Some(("gleam_string_last", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "length") => Some(("gleam_string_length", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "lowercase") => Some(("gleam_string_lowercase", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "pad_end") => {
             Some(("gleam_string_pad_end", 3,
                   &[Some("string"), Some("to"), Some("with")]))
         }
-        (_, _, true, _, _, "pad_start") => {
+        (_, _, true, _, _, _, "pad_start") => {
             Some(("gleam_string_pad_start", 3,
                   &[Some("string"), Some("to"), Some("with")]))
         }
-        (_, _, true, _, _, "remove_prefix") => {
+        (_, _, true, _, _, _, "remove_prefix") => {
             Some(("gleam_string_remove_prefix", 2, &[Some("from"), Some("matching")]))
         }
-        (_, _, true, _, _, "remove_suffix") => {
+        (_, _, true, _, _, _, "remove_suffix") => {
             Some(("gleam_string_remove_suffix", 2, &[Some("from"), Some("matching")]))
         }
-        (_, _, true, _, _, "repeat") => {
+        (_, _, true, _, _, _, "repeat") => {
             Some(("gleam_string_repeat", 2, &[Some("string"), Some("times")]))
         }
-        (_, _, true, _, _, "replace") => {
+        (_, _, true, _, _, _, "replace") => {
             Some(("gleam_string_replace", 3,
                   &[Some("in"), Some("each"), Some("with")]))
         }
-        (_, _, true, _, _, "reverse") => Some(("gleam_string_reverse", 1, &[Some("string")])),
-        (_, _, true, _, _, "slice") => {
+        (_, _, true, _, _, _, "reverse") => Some(("gleam_string_reverse", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "slice") => {
             Some(("gleam_string_slice", 3,
                   &[Some("from"), Some("at_index"), Some("length")]))
         }
-        (_, _, true, _, _, "split") => Some(("gleam_string_split", 2, &[None, Some("on")])),
-        (_, _, true, _, _, "split_once") => {
+        (_, _, true, _, _, _, "split") => Some(("gleam_string_split", 2, &[None, Some("on")])),
+        (_, _, true, _, _, _, "split_once") => {
             Some(("gleam_string_split_once", 2, &[Some("string"), Some("on")]))
         }
-        (_, _, true, _, _, "starts_with") => Some(("gleam_string_starts_with", 2, &[None, None])),
-        (_, _, true, _, _, "to_option") => Some(("gleam_string_to_option", 1, &[Some("string")])),
-        (_, _, true, _, _, "trim") => Some(("gleam_string_trim", 1, &[Some("string")])),
-        (_, _, true, _, _, "trim_end") => Some(("gleam_string_trim_end", 1, &[Some("string")])),
-        (_, _, true, _, _, "trim_start") => Some(("gleam_string_trim_start", 1, &[Some("string")])),
-        (_, _, true, _, _, "uppercase") => Some(("gleam_string_uppercase", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "starts_with") => Some(("gleam_string_starts_with", 2, &[None, None])),
+        (_, _, true, _, _, _, "to_option") => Some(("gleam_string_to_option", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "trim") => Some(("gleam_string_trim", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "trim_end") => Some(("gleam_string_trim_end", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "trim_start") => Some(("gleam_string_trim_start", 1, &[Some("string")])),
+        (_, _, true, _, _, _, "uppercase") => Some(("gleam_string_uppercase", 1, &[Some("string")])),
         // gleam/int.
-        (_, _, _, true, _, "absolute_value") => {
+        (_, _, _, true, _, _, "absolute_value") => {
             Some(("gleam_int_absolute_value", 1, &[Some("num")]))
         }
-        (_, _, _, true, _, "clamp") => {
+        (_, _, _, true, _, _, "clamp") => {
             Some(("gleam_int_clamp", 3, &[None, Some("min"), Some("max")]))
         }
-        (_, _, _, true, _, "compare") => Some(("gleam_int_compare", 2, &[None, Some("with")])),
-        (_, _, _, true, _, "digits") => {
+        (_, _, _, true, _, _, "compare") => Some(("gleam_int_compare", 2, &[None, Some("with")])),
+        (_, _, _, true, _, _, "digits") => {
             Some(("gleam_int_digits", 2, &[Some("number"), Some("base")]))
         }
-        (_, _, _, true, _, "is_even") => Some(("gleam_int_is_even", 1, &[Some("x")])),
-        (_, _, _, true, _, "is_odd") => Some(("gleam_int_is_odd", 1, &[Some("x")])),
-        (_, _, _, true, _, "max") => Some(("gleam_int_max", 2, &[None, None])),
-        (_, _, _, true, _, "min") => Some(("gleam_int_min", 2, &[None, None])),
-        (_, _, _, true, _, "negate") => Some(("gleam_int_negate", 1, &[Some("x")])),
-        (_, _, _, true, _, "parse") => Some(("gleam_int_parse", 1, &[Some("string")])),
-        (_, _, _, true, _, "product") => Some(("gleam_int_product", 1, &[Some("numbers")])),
-        (_, _, _, true, _, "random") => Some(("gleam_int_random", 2, &[None, None])),
-        (_, _, _, true, _, "sum") => Some(("gleam_int_sum", 1, &[Some("numbers")])),
-        (_, _, _, true, _, "to_base16") => Some(("gleam_int_to_base16", 1, &[Some("int")])),
-        (_, _, _, true, _, "to_base2") => Some(("gleam_int_to_base2", 1, &[Some("int")])),
-        (_, _, _, true, _, "to_base36") => Some(("gleam_int_to_base36", 1, &[Some("int")])),
-        (_, _, _, true, _, "to_base8") => Some(("gleam_int_to_base8", 1, &[Some("int")])),
-        (_, _, _, true, _, "to_base_string") => {
+        (_, _, _, true, _, _, "is_even") => Some(("gleam_int_is_even", 1, &[Some("x")])),
+        (_, _, _, true, _, _, "is_odd") => Some(("gleam_int_is_odd", 1, &[Some("x")])),
+        (_, _, _, true, _, _, "max") => Some(("gleam_int_max", 2, &[None, None])),
+        (_, _, _, true, _, _, "min") => Some(("gleam_int_min", 2, &[None, None])),
+        (_, _, _, true, _, _, "negate") => Some(("gleam_int_negate", 1, &[Some("x")])),
+        (_, _, _, true, _, _, "parse") => Some(("gleam_int_parse", 1, &[Some("string")])),
+        (_, _, _, true, _, _, "product") => Some(("gleam_int_product", 1, &[Some("numbers")])),
+        (_, _, _, true, _, _, "random") => Some(("gleam_int_random", 2, &[None, None])),
+        (_, _, _, true, _, _, "sum") => Some(("gleam_int_sum", 1, &[Some("numbers")])),
+        (_, _, _, true, _, _, "to_base16") => Some(("gleam_int_to_base16", 1, &[Some("int")])),
+        (_, _, _, true, _, _, "to_base2") => Some(("gleam_int_to_base2", 1, &[Some("int")])),
+        (_, _, _, true, _, _, "to_base36") => Some(("gleam_int_to_base36", 1, &[Some("int")])),
+        (_, _, _, true, _, _, "to_base8") => Some(("gleam_int_to_base8", 1, &[Some("int")])),
+        (_, _, _, true, _, _, "to_base_string") => {
             Some(("gleam_int_to_base_string", 2, &[Some("int"), Some("base")]))
         }
-        (_, _, _, true, _, "to_float") => Some(("gleam_int_to_float", 1, &[Some("int")])),
-        (_, _, _, true, _, "to_string") => Some(("gleam_int_to_string", 1, &[Some("int")])),
-        (_, _, _, true, _, "undigits") => {
+        (_, _, _, true, _, _, "to_float") => Some(("gleam_int_to_float", 1, &[Some("int")])),
+        (_, _, _, true, _, _, "to_string") => Some(("gleam_int_to_string", 1, &[Some("int")])),
+        (_, _, _, true, _, _, "undigits") => {
             Some(("gleam_int_undigits", 2, &[Some("numbers"), Some("base")]))
         }
         // gleam/list. `group` is excluded: it returns a `gleam/dict.Dict`,
         // which this compiler does not have.
-        (_, _, _, _, true, "all") => {
+        (_, _, _, _, true, _, "all") => {
             Some(("gleam_list_all", 2, &[Some("in"), Some("satisfying")]))
         }
-        (_, _, _, _, true, "any") => {
+        (_, _, _, _, true, _, "any") => {
             Some(("gleam_list_any", 2, &[Some("in"), Some("satisfying")]))
         }
-        (_, _, _, _, true, "append") => Some(("gleam_list_append", 2, &[])),
-        (_, _, _, _, true, "chunk") => {
+        (_, _, _, _, true, _, "append") => Some(("gleam_list_append", 2, &[])),
+        (_, _, _, _, true, _, "chunk") => {
             Some(("gleam_list_chunk", 2, &[Some("in"), Some("by")]))
         }
-        (_, _, _, _, true, "combination_pairs") => {
+        (_, _, _, _, true, _, "combination_pairs") => {
             Some(("gleam_list_combination_pairs", 1, &[None]))
         }
-        (_, _, _, _, true, "combinations") => {
+        (_, _, _, _, true, _, "combinations") => {
             Some(("gleam_list_combinations", 2, &[None, Some("by")]))
         }
-        (_, _, _, _, true, "contains") => Some(("gleam_list_contains", 2, &[])),
-        (_, _, _, _, true, "count") => {
+        (_, _, _, _, true, _, "contains") => Some(("gleam_list_contains", 2, &[])),
+        (_, _, _, _, true, _, "count") => {
             Some(("gleam_list_count", 2, &[Some("list"), Some("where")]))
         }
-        (_, _, _, _, true, "drop") => {
+        (_, _, _, _, true, _, "drop") => {
             Some(("gleam_list_drop", 2, &[Some("from"), Some("up_to")]))
         }
-        (_, _, _, _, true, "drop_while") => {
+        (_, _, _, _, true, _, "drop_while") => {
             Some(("gleam_list_drop_while", 2, &[Some("in"), Some("satisfying")]))
         }
-        (_, _, _, _, true, "each") => Some(("gleam_list_each", 2, &[])),
-        (_, _, _, _, true, "filter") => {
+        (_, _, _, _, true, _, "each") => Some(("gleam_list_each", 2, &[])),
+        (_, _, _, _, true, _, "filter") => {
             Some(("gleam_list_filter", 2, &[Some("list"), Some("keeping")]))
         }
-        (_, _, _, _, true, "filter_map") => {
+        (_, _, _, _, true, _, "filter_map") => {
             Some(("gleam_list_filter_map", 2, &[Some("list"), Some("with")]))
         }
-        (_, _, _, _, true, "find") => {
+        (_, _, _, _, true, _, "find") => {
             Some(("gleam_list_find", 2, &[Some("in"), Some("one_that")]))
         }
-        (_, _, _, _, true, "find_map") => {
+        (_, _, _, _, true, _, "find_map") => {
             Some(("gleam_list_find_map", 2, &[Some("in"), Some("with")]))
         }
-        (_, _, _, _, true, "first") => Some(("gleam_list_first", 1, &[None])),
-        (_, _, _, _, true, "flat_map") => {
+        (_, _, _, _, true, _, "first") => Some(("gleam_list_first", 1, &[None])),
+        (_, _, _, _, true, _, "flat_map") => {
             Some(("gleam_list_flat_map", 2, &[Some("over"), Some("with")]))
         }
-        (_, _, _, _, true, "flatten") => Some(("gleam_list_flatten", 1, &[None])),
-        (_, _, _, _, true, "fold") => {
+        (_, _, _, _, true, _, "flatten") => Some(("gleam_list_flatten", 1, &[None])),
+        (_, _, _, _, true, _, "fold") => {
             Some(("gleam_list_fold", 3, &[Some("over"), Some("from"), Some("with")]))
         }
-        (_, _, _, _, true, "fold_right") => {
+        (_, _, _, _, true, _, "fold_right") => {
             Some(("gleam_list_fold_right", 3,
                  &[Some("over"), Some("from"), Some("with")]))
         }
-        (_, _, _, _, true, "fold_until") => {
+        (_, _, _, _, true, _, "fold_until") => {
             Some(("gleam_list_fold_until", 3,
                  &[Some("over"), Some("from"), Some("with")]))
         }
         // `group` needs `gleam/dict`, which this compiler does not have.
-        (_, _, _, _, true, "index_fold") => {
+        (_, _, _, _, true, _, "index_fold") => {
             Some(("gleam_list_index_fold", 3,
                  &[Some("over"), Some("from"), Some("with")]))
         }
-        (_, _, _, _, true, "index_map") => {
+        (_, _, _, _, true, _, "index_map") => {
             Some(("gleam_list_index_map", 2, &[Some("list"), Some("with")]))
         }
-        (_, _, _, _, true, "interleave") => Some(("gleam_list_interleave", 1, &[None])),
-        (_, _, _, _, true, "intersperse") => {
+        (_, _, _, _, true, _, "interleave") => Some(("gleam_list_interleave", 1, &[None])),
+        (_, _, _, _, true, _, "intersperse") => {
             Some(("gleam_list_intersperse", 2, &[Some("list"), Some("with")]))
         }
-        (_, _, _, _, true, "is_empty") => Some(("gleam_list_is_empty", 1, &[None])),
-        (_, _, _, _, true, "key_filter") => {
+        (_, _, _, _, true, _, "is_empty") => Some(("gleam_list_is_empty", 1, &[None])),
+        (_, _, _, _, true, _, "key_filter") => {
             Some(("gleam_list_key_filter", 2, &[Some("in"), Some("find")]))
         }
-        (_, _, _, _, true, "key_find") => {
+        (_, _, _, _, true, _, "key_find") => {
             Some(("gleam_list_key_find", 2, &[Some("in"), Some("find")]))
         }
-        (_, _, _, _, true, "key_pop") => {
+        (_, _, _, _, true, _, "key_pop") => {
             Some(("gleam_list_key_pop", 2, &[None, Some("key")]))
         }
-        (_, _, _, _, true, "key_set") => {
+        (_, _, _, _, true, _, "key_set") => {
             Some(("gleam_list_key_set", 3, &[None, Some("key"), Some("value")]))
         }
-        (_, _, _, _, true, "last") => Some(("gleam_list_last", 1, &[None])),
-        (_, _, _, _, true, "length") => Some(("gleam_list_length", 1, &[Some("of")])),
-        (_, _, _, _, true, "map") => {
+        (_, _, _, _, true, _, "last") => Some(("gleam_list_last", 1, &[None])),
+        (_, _, _, _, true, _, "length") => Some(("gleam_list_length", 1, &[Some("of")])),
+        (_, _, _, _, true, _, "map") => {
             Some(("gleam_list_map", 2, &[Some("list"), Some("with")]))
         }
-        (_, _, _, _, true, "map2") => {
+        (_, _, _, _, true, _, "map2") => {
             Some(("gleam_list_map2", 3, &[None, None, Some("with")]))
         }
-        (_, _, _, _, true, "map_fold") => {
+        (_, _, _, _, true, _, "map_fold") => {
             Some(("gleam_list_map_fold", 3,
                  &[Some("over"), Some("from"), Some("with")]))
         }
-        (_, _, _, _, true, "max") => {
+        (_, _, _, _, true, _, "max") => {
             Some(("gleam_list_max", 2, &[Some("over"), Some("with")]))
         }
-        (_, _, _, _, true, "new") => Some(("gleam_list_new", 0, &[])),
-        (_, _, _, _, true, "partition") => {
+        (_, _, _, _, true, _, "new") => Some(("gleam_list_new", 0, &[])),
+        (_, _, _, _, true, _, "partition") => {
             Some(("gleam_list_partition", 2, &[Some("list"), Some("with")]))
         }
-        (_, _, _, _, true, "permutations") => {
+        (_, _, _, _, true, _, "permutations") => {
             Some(("gleam_list_permutations", 1, &[None]))
         }
-        (_, _, _, _, true, "prepend") => {
+        (_, _, _, _, true, _, "prepend") => {
             Some(("gleam_list_prepend", 2, &[Some("to"), Some("this")]))
         }
-        (_, _, _, _, true, "reduce") => {
+        (_, _, _, _, true, _, "reduce") => {
             Some(("gleam_list_reduce", 2, &[Some("over"), Some("with")]))
         }
-        (_, _, _, _, true, "repeat") => {
+        (_, _, _, _, true, _, "repeat") => {
             Some(("gleam_list_repeat", 2, &[Some("item"), Some("times")]))
         }
-        (_, _, _, _, true, "rest") => Some(("gleam_list_rest", 1, &[None])),
-        (_, _, _, _, true, "reverse") => Some(("gleam_list_reverse", 1, &[None])),
-        (_, _, _, _, true, "sample") => {
+        (_, _, _, _, true, _, "rest") => Some(("gleam_list_rest", 1, &[None])),
+        (_, _, _, _, true, _, "reverse") => Some(("gleam_list_reverse", 1, &[None])),
+        (_, _, _, _, true, _, "sample") => {
             Some(("gleam_list_sample", 2, &[Some("from"), Some("up_to")]))
         }
-        (_, _, _, _, true, "scan") => {
+        (_, _, _, _, true, _, "scan") => {
             Some(("gleam_list_scan", 3, &[Some("over"), Some("from"), Some("with")]))
         }
-        (_, _, _, _, true, "shuffle") => Some(("gleam_list_shuffle", 1, &[None])),
-        (_, _, _, _, true, "sized_chunk") => {
+        (_, _, _, _, true, _, "shuffle") => Some(("gleam_list_shuffle", 1, &[None])),
+        (_, _, _, _, true, _, "sized_chunk") => {
             Some(("gleam_list_sized_chunk", 2, &[Some("in"), Some("into")]))
         }
-        (_, _, _, _, true, "sort") => {
+        (_, _, _, _, true, _, "sort") => {
             Some(("gleam_list_sort", 2, &[Some("list"), Some("by")]))
         }
-        (_, _, _, _, true, "split") => {
+        (_, _, _, _, true, _, "split") => {
             Some(("gleam_list_split", 2, &[Some("list"), Some("at")]))
         }
-        (_, _, _, _, true, "split_while") => {
+        (_, _, _, _, true, _, "split_while") => {
             Some(("gleam_list_split_while", 2, &[Some("list"), Some("satisfying")]))
         }
-        (_, _, _, _, true, "strict_zip") => {
+        (_, _, _, _, true, _, "strict_zip") => {
             Some(("gleam_list_strict_zip", 2, &[Some("list"), Some("with")]))
         }
-        (_, _, _, _, true, "take") => {
+        (_, _, _, _, true, _, "take") => {
             Some(("gleam_list_take", 2, &[Some("from"), Some("up_to")]))
         }
-        (_, _, _, _, true, "take_while") => {
+        (_, _, _, _, true, _, "take_while") => {
             Some(("gleam_list_take_while", 2, &[Some("in"), Some("satisfying")]))
         }
-        (_, _, _, _, true, "transpose") => Some(("gleam_list_transpose", 1, &[None])),
-        (_, _, _, _, true, "try_each") => {
+        (_, _, _, _, true, _, "transpose") => Some(("gleam_list_transpose", 1, &[None])),
+        (_, _, _, _, true, _, "try_each") => {
             Some(("gleam_list_try_each", 2, &[Some("over"), Some("with")]))
         }
-        (_, _, _, _, true, "try_fold") => {
+        (_, _, _, _, true, _, "try_fold") => {
             Some(("gleam_list_try_fold", 3,
                  &[Some("over"), Some("from"), Some("with")]))
         }
-        (_, _, _, _, true, "try_map") => {
+        (_, _, _, _, true, _, "try_map") => {
             Some(("gleam_list_try_map", 2, &[Some("over"), Some("with")]))
         }
-        (_, _, _, _, true, "unique") => Some(("gleam_list_unique", 1, &[None])),
-        (_, _, _, _, true, "unzip") => Some(("gleam_list_unzip", 1, &[None])),
-        (_, _, _, _, true, "window") => {
+        (_, _, _, _, true, _, "unique") => Some(("gleam_list_unique", 1, &[None])),
+        (_, _, _, _, true, _, "unzip") => Some(("gleam_list_unzip", 1, &[None])),
+        (_, _, _, _, true, _, "window") => {
             Some(("gleam_list_window", 2, &[Some("list"), Some("by")]))
         }
-        (_, _, _, _, true, "window_by_2") => Some(("gleam_list_window_by_2", 1, &[None])),
-        (_, _, _, _, true, "wrap") => Some(("gleam_list_wrap", 1, &[None])),
-        (_, _, _, _, true, "zip") => {
+        (_, _, _, _, true, _, "window_by_2") => Some(("gleam_list_window_by_2", 1, &[None])),
+        (_, _, _, _, true, _, "wrap") => Some(("gleam_list_wrap", 1, &[None])),
+        (_, _, _, _, true, _, "zip") => {
             Some(("gleam_list_zip", 2, &[Some("list"), Some("with")]))
         }
+        // gleam/cli
+        (_, _, _, _, _, true, "args") => Some(("gleam_cli_args", 0, &[])),
         _ => None,
     }
 }
@@ -1709,7 +1715,7 @@ pub fn is_stdlib_module(module: &str) -> bool {
         module,
         "gleam/io" | "io" | "gleam/fs" | "gleam/filesystem" | "fs" | "filesystem"
             | "gleam/string" | "string" | "gleam/int" | "int"
-            | "gleam/list" | "list"
+            | "gleam/list" | "list" | "gleam/cli" | "cli"
     )
 }
 

@@ -214,6 +214,31 @@ fn stdlib_functions() {
 }
 
 #[test]
+fn io_readln_and_cli_args() {
+    ok(r#"
+        pub fn main() -> Nil {
+          case io.readln() {
+            Ok(line) -> io.println(line)
+            Error(nil) -> io.println("eof")
+          }
+          print_args(cli.args())
+        }
+
+        fn print_args(args: List(String)) -> Nil {
+          io.println(string.concat(args))
+        }
+    "#);
+}
+
+#[test]
+fn cli_args_arity() {
+    err(
+        "pub fn main() -> Nil {\n  cli.args(1)\n}",
+        "expects 0",
+    );
+}
+
+#[test]
 fn record_update() {
     ok(r#"
         type Point {

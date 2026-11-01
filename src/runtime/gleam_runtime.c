@@ -506,13 +506,33 @@ GValue gleam_io_read_line(GValue *args, size_t argc) {
   ssize_t length = getline(&line, &capacity, stdin);
   if (length < 0) {
     free(line);
-    return g_record("Error", 1, (GValue[]){g_string("end of input")});
+    // Matches the declared Result(String, Nil): EOF carries no payload.
+    return g_record("Error", 1, (GValue[]){g_nil()});
   }
   if (length > 0 && line[length - 1] == '\n') --length;
   if (length > 0 && line[length - 1] == '\r') --length;
   GValue result = g_record("Ok", 1, (GValue[]){g_string_n(line, length)});
   free(line);
   return result;
+}
+
+// Command line arguments, built once by the generated main() before any
+// Gleam code runs. The list owns one reference per element.
+static GValue cli_args;
+
+void gleam_init_cli_args(int argc, char **argv) {
+  // argv[0] is the program name; everything after it is user input.
+  GValue list = g_list_empty();
+  for (int i = argc - 1; i >= 1; --i) {
+    list = g_list_prepend(g_string(argv[i]), list);
+  }
+  cli_args = list;
+}
+
+GValue gleam_cli_args(GValue *args, size_t argc) {
+  (void)args;
+  require_args("cli.args", 0, argc);
+  return g_retain(cli_args);
 }
 
 static GValue fs_error(const char *operation, const char *path) {

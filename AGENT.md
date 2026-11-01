@@ -15,7 +15,7 @@ src/
   parser.rs       recursive-descent parser producing a Module
   typechecker.rs  Hindley–Milner type inference with unification
   codegen.rs      AST → C translation; also embeds the runtime via include_str!
-  main.rs         CLI: `gleam-parser <file.gleam> -o <dir>`
+  main.rs         CLI: `gleam-to-c <file.gleam> -o <dir>`
   runtime/
     gleam_runtime.h   GValue model + all runtime/stdlib declarations
     gleam_runtime.c   runtime implementation + all stdlib function bodies
@@ -32,7 +32,7 @@ gleam_std_*.html  vendored stdlib docs (string, int, list, ...)
 
 ```sh
 cargo build
-./target/debug/gleam-parser tests/hello.gleam -o /tmp/out
+./target/debug/gleam-to-c tests/hello.gleam -o /tmp/out
 cc -std=c11 -Wall -Wextra /tmp/out/main.c /tmp/out/gleam_runtime.c -o /tmp/prog
 /tmp/prog
 cargo test    # parser tests + e2e runtime tests (skipped if no cc)
@@ -146,7 +146,7 @@ this way.
 3. **Register in `src/codegen.rs`:**
    - Add an entry to `std_function` for every function:
      `Some(("gleam_<module>_<name>", arity, &[labels...]))`. The match is on
-     a tuple of module booleans `(io, fs, string, int, list, name)` — add a
+     a tuple of module booleans `(io, fs, string, int, list, cli, name)` — add a
      new boolean + extend every existing pattern when adding a module.
    - Add the module to `is_stdlib_module` so it works without an import.
    - Register any new custom-type constructors (e.g. `InvalidBase`) in the
@@ -294,7 +294,8 @@ this way.
 
 | Module | Status |
 |---|---|
-| `gleam/io` | `print`, `println`, `debug`, `read_line` |
+| `gleam/io` | `print`, `println`, `debug`, `read_line`, `readln` |
+| `gleam/cli` | `args` (command-line arguments as a list of strings) |
 | `gleam/fs` | `read`, `write`, `append`, `remove`, `is_file`, `is_directory`, `create_directory`, `list_directory` |
 | `gleam/string` | 31 functions; grapheme/UTF functions excluded (`drop_start`, `drop_end`, `pop_grapheme`, `to_graphemes`, `utf_codepoint`, `utf_codepoint_to_int`, `to_utf_codepoints`, `from_utf_codepoints`). Grapheme counting is approximated via a combining-mark table. |
 | `gleam/int` | all 21 functions |

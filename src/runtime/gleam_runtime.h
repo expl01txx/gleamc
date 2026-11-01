@@ -243,6 +243,10 @@ GValue gleam_io_print(GValue *args, size_t argc);
 GValue gleam_io_println(GValue *args, size_t argc);
 GValue gleam_io_debug(GValue *args, size_t argc);
 GValue gleam_io_read_line(GValue *args, size_t argc);
+
+void gleam_init_cli_args(int argc, char **argv);
+GValue gleam_cli_args(GValue *args, size_t argc);
+
 GValue gleam_fs_read(GValue *args, size_t argc);
 GValue gleam_fs_write(GValue *args, size_t argc);
 GValue gleam_fs_append(GValue *args, size_t argc);
