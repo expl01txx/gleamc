@@ -76,11 +76,34 @@ struct GClosure {
 
 typedef struct {
   GHeader header;
-  size_t length;
+  size_t bit_length;
   unsigned char data[];
 } GBytes;
 
+typedef enum {
+  G_BIT_INT, G_BIT_FLOAT, G_BIT_BITS, G_BIT_BYTES,
+  G_BIT_UTF8, G_BIT_UTF16, G_BIT_UTF32,
+  G_BIT_CODEPOINT8, G_BIT_CODEPOINT16, G_BIT_CODEPOINT32
+} GBitKind;
+
+typedef enum { G_BIT_BIG, G_BIT_LITTLE, G_BIT_NATIVE } GBitEndian;
+
+typedef struct {
+  unsigned char *data;
+  size_t length;
+  size_t capacity;
+} GBitBuilder;
+
+void g_bits_append(GBitBuilder *builder, GValue value, GBitKind kind,
+                   GBitEndian endian, GValue size, size_t unit);
+GValue g_bits_finish(GBitBuilder *builder);
+int g_bits_take(GValue value, size_t *offset, GBitKind kind, GBitEndian endian,
+                GValue size, size_t unit, int is_signed, GValue *result);
+int g_bits_prefix(GValue value, size_t *offset, GValue prefix);
+int g_bits_end(GValue value, size_t offset);
+
 GValue g_int(int64_t value);
+GValue g_int_from_bits(uint64_t value);
 GValue g_float(double value);
 GValue g_bool(int value);
 GValue g_nil(void);
@@ -102,8 +125,8 @@ int g_arity(GValue function);
 
 int g_equal(GValue left, GValue right);
 GValue g_string_concat(GValue left, GValue right);
-int g_string_equals(GValue value, const char *expected);
-int g_string_starts_with(GValue value, const char *prefix);
+int g_string_equals_n(GValue value, const char *expected, size_t length);
+int g_string_starts_with_n(GValue value, const char *prefix, size_t length);
 GValue g_string_drop_prefix(GValue value, size_t bytes);
 GValue g_list_spread(GValue elements, GValue rest);
 GValue g_list_head(GValue list);
@@ -116,6 +139,7 @@ int g_record_is(GValue record, const char *tag);
 GValue g_int_divide(GValue left, GValue right);
 GValue g_int_modulo(GValue left, GValue right);
 void g_echo(GValue value, const char *file, int line);
+_Noreturn void g_panic_value(GValue message, const char *file, int line);
 _Noreturn void g_panic(const char *message, const char *file, int line);
 void g_type_error(const char *expected, GValue actual, const char *file,
                   int line);

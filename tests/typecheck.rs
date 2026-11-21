@@ -502,3 +502,83 @@ fn errors_carry_spans() {
     // The source is available, so line/col are populated.
     assert!(e.line.is_some() && e.col.is_some(), "line/col should be set");
 }
+
+#[test]
+fn bit_array_segment_types_are_checked() {
+    err("pub fn main() { <<True>> }", "type mismatch");
+    err("pub fn main() { <<1:bits>> }", "type mismatch");
+    err("pub fn main() { <<1:float-int>> }", "conflicting");
+    err("pub fn main() { <<1:size(\"8\")>> }", "type mismatch");
+    err("pub fn main() { <<1:size(2)-unit(0)>> }", "1 to 256");
+    err(
+        "pub fn main(bits: BitArray) { case bits { <<a:bits, b:bits>> -> a _ -> bits } }",
+        "only the last",
+    );
+}
+
+#[test]
+fn alternative_patterns_bind_identical_names_and_types() {
+    err(
+        "pub fn main(a: Int, b: Int) { case a, b { 0, x | y, 0 -> x _, _ -> 0 } }",
+        "must bind the same variables",
+    );
+    err(
+        "pub fn main(a: Int, b: Bool) { case a, b { 0, x | x, True -> x _, _ -> False } }",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn annotations_apply_to_callbacks_and_assertions() {
+    err(
+        "pub fn main() { fn(a: Int) -> Bool { a } }",
+        "type mismatch",
+    );
+    err(
+        "pub fn main() { let assert x: Int = True x }",
+        "type mismatch",
+    );
+    err(
+        "fn run(f: fn(Int) -> Int) { f(1) } pub fn main() { use x: Bool <- run x }",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn type_parameters_connect_constructors_to_their_fields() {
+    err(
+        "type Box(a) { Box(value: a) } pub fn main() -> Box(String) { Box(1) }",
+        "type mismatch",
+    );
+    err(
+        "type Pair(a) { Pair(first: a, second: a) } pub fn main() { Pair(1, True) }",
+        "type mismatch",
+    );
+    err(
+        "type Box(a) { Box(value: a) } pub fn main() -> String { Box(1).value }",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn inference_resolves_forward_and_recursive_references() {
+    ok("pub fn main() { #(identity(1), identity(True)) } fn identity(x) { x }");
+    err(
+        "pub fn main() { takes_int(True) } fn takes_int(x) { x + 1 }",
+        "type mismatch",
+    );
+    err(
+        "pub fn f(x: Int) { g(x) } fn g(x) { f(True) x }",
+        "type mismatch",
+    );
+    err(
+        "const first = second const second = first",
+        "cyclic constant",
+    );
+}
+
+#[test]
+fn panic_and_assert_messages_must_be_strings() {
+    err("pub fn main() { panic as 123 }", "type mismatch");
+    err("pub fn main() { assert True as { 123 } }", "type mismatch");
+}

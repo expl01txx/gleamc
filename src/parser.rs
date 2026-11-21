@@ -98,6 +98,33 @@ impl Parser {
         }
     }
 
+    fn expect_argument_name(&mut self, what: &str) -> Result<String, ParseError> {
+        if let TokenKind::DiscardVariable(name) = self.peek().clone() {
+            self.consume();
+            Ok(name)
+        } else {
+            self.expect_variable(what)
+        }
+    }
+
+    fn parse_negative_number(&mut self) -> Result<ConstValue, ParseError> {
+        self.consume();
+        match self.peek() {
+            TokenKind::Int(_) => {
+                let mut value = int_from_token(self.consume().kind);
+                value.raw.insert(0, '-');
+                Ok(ConstValue::Int(value))
+            }
+            TokenKind::Float(..) => {
+                let mut value = float_from_token(self.consume().kind);
+                value.raw.insert(0, '-');
+                value.value = -value.value;
+                Ok(ConstValue::Float(value))
+            }
+            _ => Err(self.unexpected("an integer or float literal after `-`")),
+        }
+    }
+
     /// Consume a `String` token, returning its value.
     fn expect_string_lit(&mut self, what: &str) -> Result<String, ParseError> {
         match self.peek().clone() {
@@ -209,7 +236,10 @@ impl Parser {
 
         // Attributes.
         let mut attributes = Vec::new();
-        while matches!(self.peek(), TokenKind::External | TokenKind::Deprecated) {
+        while matches!(
+            self.peek(),
+            TokenKind::External | TokenKind::Deprecated | TokenKind::Internal
+        ) {
             attributes.push(self.parse_attribute()?);
         }
 
@@ -238,10 +268,15 @@ impl Parser {
                         let c = self.parse_const(true)?;
                         Definition::Constant(c)
                     }
-                    other => return Err(self.error_at(
-                        &self.current_token(),
-                        format!("expected `type`, `fn` or `const` after `pub`, found {}", other.describe()),
-                    )),
+                    other => {
+                        return Err(self.error_at(
+                            self.current_token(),
+                            format!(
+                                "expected `type`, `fn` or `const` after `pub`, found {}",
+                                other.describe()
+                            ),
+                        ))
+                    }
                 }
             }
             TokenKind::Type => {
@@ -256,13 +291,15 @@ impl Parser {
                 let c = self.parse_const(false)?;
                 Definition::Constant(c)
             }
-            other => return Err(self.error_at(
-                &self.current_token(),
-                format!(
-                    "expected a definition (`import`, `const`, `fn` or `type`), found {}",
-                    other.describe()
-                ),
-            )),
+            other => {
+                return Err(self.error_at(
+                    self.current_token(),
+                    format!(
+                        "expected a definition (`import`, `const`, `fn` or `type`), found {}",
+                        other.describe()
+                    ),
+                ))
+            }
         };
 
         Ok(with_docs(attach_attributes(defn, attributes), docs))
@@ -284,6 +321,10 @@ impl Parser {
                     module,
                     function,
                 }))
+            }
+            TokenKind::Internal => {
+                self.consume();
+                Ok(Attribute::Internal)
             }
             TokenKind::Deprecated => {
                 self.consume();
@@ -315,38 +356,47 @@ impl Parser {
             module.push(self.expect_variable("a module name segment")?);
         }
 
-        // Optional alias.
-        let mut alias = None;
-        if self.skip(&TokenKind::As) {
-            alias = Some(self.expect_variable("the module alias after `as`")?);
+        let mut alias = if self.skip(&TokenKind::As) {
+            Some(self.expect_argument_name("the module alias after `as`")?)
+        } else {
+            None
+        };
+        if self.peek_at(1) == &TokenKind::OpenBlock {
+            self.skip(&TokenKind::Dot);
         }
-
-        // Optional unqualified import list.
         let mut unqualified = Vec::new();
         if self.skip(&TokenKind::OpenBlock) {
-            loop {
-                if self.peek() == &TokenKind::Type {
-                    self.consume();
-                    unqualified.push(UnqualifiedImport::Type(
-                        self.expect_type_name("a type name in the import list")?,
-                    ));
-                } else if matches!(self.peek(), TokenKind::Variable(_) | TokenKind::TypeName(_)) {
-                    let name = self.consume().kind;
-                    unqualified.push(UnqualifiedImport::Value(match name {
-                        TokenKind::Variable(n) | TokenKind::TypeName(n) => n,
-                        _ => unreachable!(),
-                    }));
-                } else if self.peek() == &TokenKind::CloseBlock {
-                    break;
+            while self.peek() != &TokenKind::CloseBlock {
+                let is_type = self.skip(&TokenKind::Type);
+                let uppercase = matches!(self.peek(), TokenKind::TypeName(_));
+                let name = if is_type || uppercase {
+                    self.expect_type_name("a type or constructor name in the import list")?
                 } else {
-                    return Err(self.unexpected("a function or `type Type` name in the import list"));
+                    self.expect_variable("a value name in the import list")?
+                };
+                let item_alias = if self.skip(&TokenKind::As) {
+                    Some(if is_type || uppercase {
+                        self.expect_type_name("a type or constructor import alias")?
+                    } else {
+                        self.expect_variable("a value import alias")?
+                    })
+                } else {
+                    None
+                };
+                unqualified.push(match (is_type, item_alias) {
+                    (true, Some(alias)) => UnqualifiedImport::TypeAlias { name, alias },
+                    (false, Some(alias)) => UnqualifiedImport::ValueAlias { name, alias },
+                    (true, None) => UnqualifiedImport::Type(name),
+                    (false, None) => UnqualifiedImport::Value(name),
+                });
+                if !self.skip(&TokenKind::Comma) {
+                    break;
                 }
-                if self.skip(&TokenKind::Comma) {
-                    continue;
-                }
-                self.expect(&TokenKind::CloseBlock, "`,` or `}` in the import list")?;
-                break;
             }
+            self.expect(&TokenKind::CloseBlock, "`}` after the import list")?;
+        }
+        if alias.is_none() && self.skip(&TokenKind::As) {
+            alias = Some(self.expect_argument_name("the module alias after `as`")?);
         }
 
         Ok(Import {
@@ -526,7 +576,7 @@ impl Parser {
     }
 
     fn parse_fn_arg(&mut self) -> Result<FnArg, ParseError> {
-        let first = self.expect_variable("an argument name")?;
+        let first = self.expect_argument_name("an argument name")?;
 
         // `name: type`
         if self.peek() == &TokenKind::Colon {
@@ -540,15 +590,21 @@ impl Parser {
         }
 
         // `label name: type`
-        if matches!(self.peek(), TokenKind::Variable(_)) && self.peek_at(1) == &TokenKind::Colon {
+        if matches!(
+            self.peek(),
+            TokenKind::Variable(_) | TokenKind::DiscardVariable(_)
+        ) {
             let label = first;
-            let second = self.expect_variable("the argument name after the label")?;
-            self.consume(); // `:`
-            let ty = self.parse_type_annotation()?;
+            let second = self.expect_argument_name("the argument name after the label")?;
+            let type_annotation = if self.skip(&TokenKind::Colon) {
+                Some(self.parse_type_annotation()?)
+            } else {
+                None
+            };
             return Ok(FnArg {
                 label: Some(label),
                 name: second,
-                type_annotation: Some(ty),
+                type_annotation,
             });
         }
 
@@ -590,7 +646,16 @@ impl Parser {
     }
 
     fn parse_const_value(&mut self) -> Result<ConstValue, ParseError> {
+        let mut value = self.parse_const_atom()?;
+        while self.skip(&TokenKind::Concatenate) {
+            value = ConstValue::Concat(Box::new(value), Box::new(self.parse_const_atom()?));
+        }
+        Ok(value)
+    }
+
+    fn parse_const_atom(&mut self) -> Result<ConstValue, ParseError> {
         match self.peek().clone() {
+            TokenKind::Minus => self.parse_negative_number(),
             TokenKind::Int(_) => Ok(ConstValue::Int(int_from_token(self.consume().kind))),
             TokenKind::Float(_, _) => Ok(ConstValue::Float(float_from_token(self.consume().kind))),
             TokenKind::String(_) => Ok(ConstValue::String(string_from_token(self.consume().kind))),
@@ -617,18 +682,22 @@ impl Parser {
                         TokenKind::TypeName(n) => n,
                         _ => unreachable!(),
                     };
-                    return Ok(self.parse_const_constructor(
+                    return self.parse_const_constructor(
                         ConstructorRef { module: Some(name), name: cname },
-                    )?);
+                    );
+                }
+                if self.skip(&TokenKind::Dot) {
+                    let value = self.expect_variable("a module constant name")?;
+                    return Ok(ConstValue::Qualified { module: name, name: value });
                 }
                 Ok(ConstValue::Var(name))
             }
             TokenKind::TypeName(_) => {
                 // A constructor with const arguments.
                 let name = self.expect_type_name("a constructor name")?;
-                return Ok(self.parse_const_constructor(
+                self.parse_const_constructor(
                     ConstructorRef { module: None, name },
-                )?);
+                )
             }
             TokenKind::OpenSquare => self.parse_const_list(),
             TokenKind::HashOpen => self.parse_const_tuple(),
@@ -637,7 +706,7 @@ impl Parser {
                 Ok(ConstValue::BitArray(ba))
             }
             other => Err(self.error_at(
-                &self.current_token(),
+                self.current_token(),
                 format!(
                     "expected a constant value (literal, list, tuple, bit array or constructor), found {}",
                     other.describe()
@@ -681,44 +750,34 @@ impl Parser {
     }
 
     fn parse_const_list(&mut self) -> Result<ConstValue, ParseError> {
-        self.consume(); // `[`
+        self.consume();
         let mut elements = Vec::new();
         let mut spread = None;
-        if self.peek() != &TokenKind::CloseSquare {
-            loop {
-                if self.skip(&TokenKind::TwoDots) {
-                    spread = Some(Box::new(self.parse_const_value()?));
-                    self.expect(&TokenKind::CloseSquare, "`,` or `]` in the list")?;
-                    break;
-                }
-                elements.push(self.parse_const_value()?);
-                if self.skip(&TokenKind::Comma) {
-                    continue;
-                }
-                self.expect(&TokenKind::CloseSquare, "an element or `]` in the list")?;
+        while self.peek() != &TokenKind::CloseSquare {
+            if self.skip(&TokenKind::TwoDots) {
+                spread = Some(Box::new(self.parse_const_value()?));
+                self.skip(&TokenKind::Comma);
                 break;
             }
-        } else {
-            self.consume();
+            elements.push(self.parse_const_value()?);
+            if !self.skip(&TokenKind::Comma) {
+                break;
+            }
         }
+        self.expect(&TokenKind::CloseSquare, "`]` after the constant list")?;
         Ok(ConstValue::List { elements, spread })
     }
 
     fn parse_const_tuple(&mut self) -> Result<ConstValue, ParseError> {
-        self.consume(); // `#(`
+        self.consume();
         let mut elements = Vec::new();
-        if self.peek() != &TokenKind::CloseParen {
-            loop {
-                elements.push(self.parse_const_value()?);
-                if self.skip(&TokenKind::Comma) {
-                    continue;
-                }
-                self.expect(&TokenKind::CloseParen, "`,` or `)` in the tuple")?;
+        while self.peek() != &TokenKind::CloseParen {
+            elements.push(self.parse_const_value()?);
+            if !self.skip(&TokenKind::Comma) {
                 break;
             }
-        } else {
-            self.consume();
         }
+        self.expect(&TokenKind::CloseParen, "`)` after the constant tuple")?;
         Ok(ConstValue::Tuple(elements))
     }
 
@@ -742,11 +801,15 @@ impl Parser {
                 let value = Box::new(self.parse_expression()?);
                 if is_assert {
                     let message = self.optional_as_message()?;
-                    Ok(self.expr(start, Expr::LetAssert(LetAssert {
-                        pattern,
-                        value,
-                        message,
-                    })))
+                    Ok(self.expr(
+                        start,
+                        Expr::LetAssert(LetAssert {
+                            pattern,
+                            annotation,
+                            value,
+                            message,
+                        }),
+                    ))
                 } else {
                     Ok(self.expr(start, Expr::Let(Let {
                         pattern,
@@ -767,17 +830,17 @@ impl Parser {
                 Ok(self.expr(start, Expr::Echo(Box::new(inner))))
             }
             TokenKind::Use => Err(self.error_at(
-                &self.current_token(),
+                self.current_token(),
                 "`use` can only be used at the start of a block",
             )),
             _ => self.parse_pipeline(),
         }
     }
 
-    /// The optional `as "message"` suffix on asserts, panics and todos.
-    fn optional_as_message(&mut self) -> Result<Option<String>, ParseError> {
+    /// The optional `as message` suffix on assertions, panics and todos.
+    fn optional_as_message(&mut self) -> Result<Option<Box<Expression>>, ParseError> {
         if self.skip(&TokenKind::As) {
-            Ok(Some(self.expect_string_lit("the string message after `as`")?))
+            Ok(Some(Box::new(self.parse_postfix()?)))
         } else {
             Ok(None)
         }
@@ -789,7 +852,15 @@ impl Parser {
         let mut pipe_spans = Vec::new();
         while self.peek() == &TokenKind::PipeTo {
             pipe_spans.push(self.consume().span);
-            exprs.push(self.parse_binary(0)?);
+            if self.peek() == &TokenKind::Echo {
+                let echo = self.consume();
+                exprs.push(Expression {
+                    expr: Expr::EchoPipe,
+                    span: echo.span,
+                });
+            } else {
+                exprs.push(self.parse_binary(0)?);
+            }
         }
         if pipe_spans.is_empty() {
             Ok(exprs.pop().unwrap())
@@ -897,6 +968,19 @@ impl Parser {
                 // Field access: `.label` where label is an identifier or a
                 // tuple index digit.
                 self.consume();
+                if let (Expr::Var(module), TokenKind::TypeName(name)) =
+                    (&base.expr, self.peek().clone())
+                {
+                    self.consume();
+                    base = self.expr(
+                        start,
+                        Expr::Constructor(ConstructorRef {
+                            module: Some(module.clone()),
+                            name,
+                        }),
+                    );
+                    continue;
+                }
                 let label = match self.peek().clone() {
                     TokenKind::Variable(name) => {
                         self.consume();
@@ -911,8 +995,11 @@ impl Parser {
                     }
                     other => {
                         return Err(self.error_at(
-                            &self.current_token(),
-                            format!("expected a field name after `.`, found {}", other.describe()),
+                            self.current_token(),
+                            format!(
+                                "expected a field name after `.`, found {}",
+                                other.describe()
+                            ),
                         ))
                     }
                 };
@@ -997,7 +1084,7 @@ impl Parser {
             }
             break;
         }
-        self.consume(); // `)`
+        self.expect(&TokenKind::CloseParen, "`)` after the call arguments")?;
 
         Ok(raw)
     }
@@ -1026,7 +1113,7 @@ impl Parser {
                         },
                         _ => {
                             return Err(self.error_at(
-                                &self.current_token(),
+                                self.current_token(),
                                 "record updates can only be used with record constructors, e.g. `Person(..person)`",
                             ))
                         }
@@ -1034,7 +1121,7 @@ impl Parser {
                 }
                 _ => {
                     return Err(self.error_at(
-                        &self.current_token(),
+                        self.current_token(),
                         "record updates can only be used with record constructors, e.g. `Person(..person)`",
                     ))
                 }
@@ -1047,13 +1134,13 @@ impl Parser {
                     }
                     RawArg::Value(_) => {
                         return Err(self.error_at(
-                            &self.current_token(),
+                            self.current_token(),
                             "only labelled arguments can follow `..` in a record update",
                         ))
                     }
                     RawArg::Placeholder | RawArg::LabelledPlaceholder(_) => {
                         return Err(self.error_at(
-                            &self.current_token(),
+                            self.current_token(),
                             "`_` placeholders are not allowed in record updates",
                         ))
                     }
@@ -1073,32 +1160,23 @@ impl Parser {
             .filter(|a| matches!(a, RawArg::Placeholder | RawArg::LabelledPlaceholder(_)))
             .count();
         if placeholders == 1 {
-            let is_simple_fn = match &fun.expr {
-                Expr::Var(name) => name.starts_with(|c: char| c.is_ascii_lowercase()),
-                // A module qualified function: `io.println`.
-                Expr::FieldAccess { base, label } => {
-                    matches!(&base.expr, Expr::Var(_))
-                        && label.starts_with(|c: char| c.is_ascii_lowercase())
-                }
-                _ => false,
-            };
-            if is_simple_fn {
-                let args = raw
-                    .args
-                    .into_iter()
-                    .map(|a| match a {
-                        RawArg::Value(v) => CaptureArg::Value(v),
-                        RawArg::Labelled { value, .. } => CaptureArg::Value(value),
-                        RawArg::Placeholder | RawArg::LabelledPlaceholder(_) => {
-                            CaptureArg::Placeholder
-                        }
-                    })
-                    .collect();
-                return Ok(self.expr(start, Expr::Capture(Capture {
+            let args = raw
+                .args
+                .into_iter()
+                .map(|arg| match arg {
+                    RawArg::Value(value) => CaptureArg::Value(value),
+                    RawArg::Labelled { label, value } => CaptureArg::Labelled { label, value },
+                    RawArg::Placeholder => CaptureArg::Placeholder,
+                    RawArg::LabelledPlaceholder(label) => CaptureArg::LabelledPlaceholder(label),
+                })
+                .collect();
+            return Ok(self.expr(
+                start,
+                Expr::Capture(Capture {
                     fun: Box::new(fun),
                     args,
-                })));
-            }
+                }),
+            ));
         }
 
         // A plain call.
@@ -1107,12 +1185,10 @@ impl Parser {
             match arg {
                 RawArg::Value(v) => args.push(CallArg::Value(v)),
                 RawArg::Labelled { label, value } => args.push(CallArg::Labelled { label, value }),
-                RawArg::Placeholder | RawArg::LabelledPlaceholder(_) => {
-                    return Err(self.error_at(
-                        &self.current_token(),
-                        "`_` can only be used as an argument in a function capture, e.g. `add(1, _)`",
-                    ))
-                }
+                RawArg::Placeholder | RawArg::LabelledPlaceholder(_) => return Err(self.error_at(
+                    self.current_token(),
+                    "`_` can only be used as an argument in a function capture, e.g. `add(1, _)`",
+                )),
             }
         }
         Ok(self.expr(start, Expr::Call(Call {
@@ -1164,7 +1240,7 @@ impl Parser {
                 })))
             }
             TokenKind::DiscardVariable(_) => Err(self.error_at(
-                &self.current_token(),
+                self.current_token(),
                 "discard variables (`_`) can only be used in patterns",
             )),
             TokenKind::OpenParen => {
@@ -1198,7 +1274,7 @@ impl Parser {
                 Ok(self.expr(start, Expr::Panic { message }))
             }
             other => Err(self.error_at(
-                &self.current_token(),
+                self.current_token(),
                 format!("expected an expression, found {}", other.describe()),
             )),
         }
@@ -1211,64 +1287,60 @@ impl Parser {
     fn parse_block(&mut self) -> Result<Expression, ParseError> {
         let start = self.peek_span();
         self.expect(&TokenKind::OpenBlock, "`{` to start a block")?;
+        self.parse_block_rest(start)
+    }
 
-        // Collect leading `use` expressions.
-        struct UseHead {
-            patterns: Vec<Pattern>,
-            call: Expression,
-        }
-        let mut uses: Vec<UseHead> = Vec::new();
-        while self.peek() == &TokenKind::Use {
-            self.consume();
-            let mut patterns = Vec::new();
-            loop {
-                patterns.push(self.parse_pattern()?);
-                if self.skip(&TokenKind::Comma) {
-                    continue;
-                }
-                break;
-            }
-            self.expect(&TokenKind::DashArrow, "`<-` after the `use` patterns")?;
-            let call = self.parse_expression()?;
-            uses.push(UseHead { patterns, call });
-        }
-
-        // The rest of the block.
+    fn parse_block_rest(&mut self, start: Span) -> Result<Expression, ParseError> {
         let mut statements = Vec::new();
-        while self.peek() != &TokenKind::CloseBlock {
+        while !matches!(self.peek(), TokenKind::CloseBlock | TokenKind::Use) {
             if self.peek() == &TokenKind::EndOfFile {
                 return Err(self.unexpected("`}` to close the block"));
             }
             statements.push(self.parse_expression()?);
         }
-        let close = self.expect(&TokenKind::CloseBlock, "the closing `}` of the block")?;
-
-        if uses.is_empty() {
-            if statements.is_empty() {
-                return Err(self.error_at(
-                    &close,
-                    "a block cannot be empty; every function must return a value",
-                ));
+        if self.peek() == &TokenKind::Use {
+            let use_start = self.consume().span;
+            let mut patterns = Vec::new();
+            let mut annotations = Vec::new();
+            while self.peek() != &TokenKind::DashArrow {
+                patterns.push(self.parse_as_pattern()?);
+                let annotation = if self.skip(&TokenKind::Colon) {
+                    Some(self.parse_type_annotation()?)
+                } else {
+                    None
+                };
+                annotations.push(annotation);
+                if !self.skip(&TokenKind::Comma) {
+                    break;
+                }
             }
-            return Ok(Expression {
-                expr: Expr::Block(statements),
-                span: start.merge(close.span),
-            });
+            self.expect(&TokenKind::DashArrow, "`<-` after the `use` patterns")?;
+            let call = self.parse_expression()?;
+            let body = if self.skip(&TokenKind::CloseBlock) {
+                self.expr(use_start, Expr::Todo { message: None })
+            } else {
+                self.parse_block_rest(use_start)?
+            };
+            let use_ = self.expr(
+                use_start,
+                Expr::Use(Use {
+                    patterns,
+                    annotations,
+                    call: Box::new(call),
+                    body: Box::new(body),
+                }),
+            );
+            if statements.is_empty() {
+                return Ok(use_);
+            }
+            statements.push(use_);
+        } else {
+            self.expect(&TokenKind::CloseBlock, "the closing `}` of the block")?;
+            if statements.is_empty() {
+                return Err(self.unexpected("a block cannot be empty"));
+            }
         }
-
-        // Build nested `use` expressions around the block body.
-        let mut body = Expression {
-            expr: Expr::Block(statements),
-            span: start.merge(close.span),
-        };
-        for use_head in uses.into_iter().rev() {
-            body = self.expr(start, Expr::Use(Use {
-                patterns: use_head.patterns,
-                call: Box::new(use_head.call),
-                body: Box::new(body),
-            }));
-        }
-        Ok(body)
+        Ok(self.expr(start, Expr::Block(statements)))
     }
 
     // ------------------------------------------------------------------
@@ -1296,24 +1368,33 @@ impl Parser {
             }
             let clause_start = self.peek_span();
 
-            let mut patterns = Vec::new();
+            let mut groups = Vec::new();
             loop {
-                patterns.push(self.parse_pattern()?);
-                if self.skip(&TokenKind::Comma) {
-                    continue;
+                let mut patterns = vec![self.parse_as_pattern()?];
+                while self.skip(&TokenKind::Comma) {
+                    patterns.push(self.parse_as_pattern()?);
                 }
-                break;
+                if patterns.len() != subjects.len() {
+                    return Err(self.error_at(
+                        self.current_token(),
+                        format!(
+                            "expected {} pattern(s), one per subject, found {}",
+                            subjects.len(),
+                            patterns.len()
+                        ),
+                    ));
+                }
+                groups.push(patterns);
+                if !self.skip(&TokenKind::Pipe) {
+                    break;
+                }
             }
-
-            if patterns.len() != subjects.len() {
-                return Err(self.error_at(
-                    &self.current_token(),
-                    format!(
-                        "expected {} pattern(s), one per subject, found {}",
-                        subjects.len(),
-                        patterns.len()
-                    ),
-                ));
+            let mut alternatives = groups.split_off(1);
+            let mut patterns = groups.pop().expect("at least one pattern group");
+            if patterns.len() == 1 && !alternatives.is_empty() {
+                let mut choices = std::mem::take(&mut patterns);
+                choices.extend(alternatives.drain(..).flatten());
+                patterns.push(Pattern::Alternative(choices));
             }
 
             let mut guard = None;
@@ -1326,6 +1407,7 @@ impl Parser {
 
             clauses.push(Clause {
                 patterns,
+                alternatives,
                 guard,
                 expression,
                 span: clause_start.merge(self.current_token().span),
@@ -1348,39 +1430,38 @@ impl Parser {
         self.expect(&TokenKind::OpenParen, "`(` after `fn`")?;
 
         let mut args = Vec::new();
-        if self.peek() != &TokenKind::CloseParen {
-            loop {
-                match self.peek().clone() {
-                    TokenKind::Variable(name) | TokenKind::DiscardVariable(name) => {
-                        self.consume();
-                        args.push(name);
-                    }
-                    other => {
-                        return Err(self.error_at(
-                            &self.current_token(),
-                            format!(
-                                "expected a parameter name in the anonymous function, found {}",
-                                other.describe()
-                            ),
-                        ))
-                    }
-                }
-                if self.skip(&TokenKind::Comma) {
-                    continue;
-                }
-                self.expect(&TokenKind::CloseParen, "`,` or `)` in the anonymous function arguments")?;
+        let mut annotations = Vec::new();
+        while self.peek() != &TokenKind::CloseParen {
+            args.push(self.expect_argument_name("an anonymous function parameter")?);
+            annotations.push(if self.skip(&TokenKind::Colon) {
+                Some(self.parse_type_annotation()?)
+            } else {
+                None
+            });
+            if !self.skip(&TokenKind::Comma) {
                 break;
             }
-        } else {
-            self.consume();
         }
-
+        self.expect(
+            &TokenKind::CloseParen,
+            "`)` after the anonymous function arguments",
+        )?;
+        let return_annotation = if self.skip(&TokenKind::Arrow) {
+            Some(self.parse_type_annotation()?)
+        } else {
+            None
+        };
         let body = self.parse_block()?;
 
-        Ok(self.expr(start, Expr::Fn(FnLiteral {
-            args,
-            body: Box::new(body),
-        })))
+        Ok(self.expr(
+            start,
+            Expr::Fn(FnLiteral {
+                args,
+                annotations,
+                return_annotation,
+                body: Box::new(body),
+            }),
+        ))
     }
 
     // ------------------------------------------------------------------
@@ -1398,14 +1479,15 @@ impl Parser {
             }
             if self.skip(&TokenKind::TwoDots) {
                 spread = Some(Box::new(self.parse_expression()?));
-                continue;
+                self.skip(&TokenKind::Comma);
+                break;
             }
             elements.push(self.parse_expression()?);
             if !self.skip(&TokenKind::Comma) {
                 break; // `]` is consumed below.
             }
         }
-        self.consume(); // `]`
+        self.expect(&TokenKind::CloseSquare, "`]` after the list")?;
 
         Ok(self.expr(start, Expr::List { elements, spread }))
     }
@@ -1422,15 +1504,9 @@ impl Parser {
             if self.skip(&TokenKind::Comma) {
                 continue;
             }
-            // Single-element tuples require a trailing comma: `#(1,)`.
-            if elements.len() < 2 {
-                return Err(self.unexpected(
-                    "a `,` after the single tuple element (e.g. `#(1,)`)",
-                ));
-            }
             break;
         }
-        self.consume(); // `)`
+        self.expect(&TokenKind::CloseParen, "`)` after the tuple")?;
 
         Ok(self.expr(start, Expr::Tuple(elements)))
     }
@@ -1460,7 +1536,7 @@ impl Parser {
                 break; // `>>` is consumed below.
             }
         }
-        self.consume(); // `>>`
+        self.expect(&TokenKind::BitArrayEnd, "`>>` after the bit array segments")?;
 
         Ok(BitArray { segments })
     }
@@ -1469,6 +1545,11 @@ impl Parser {
         let mut options = Vec::new();
         loop {
             match self.peek().clone() {
+                TokenKind::Int(_) => {
+                    let start = self.peek_span();
+                    let value = int_from_token(self.consume().kind);
+                    options.push(BitOption::Size(self.expr(start, Expr::Int(value))));
+                }
                 TokenKind::Variable(name) => {
                     self.consume();
                     let option = match name.as_str() {
@@ -1499,7 +1580,7 @@ impl Parser {
                         }
                         other => {
                             return Err(self.error_at(
-                                &self.current_token(),
+                                self.current_token(),
                                 format!("unknown bit array option `{other}`"),
                             ))
                         }
@@ -1550,29 +1631,41 @@ impl Parser {
 
     fn parse_concat_pattern(&mut self) -> Result<Pattern, ParseError> {
         let base = self.parse_base_pattern()?;
-        // String prefix pattern: `"prefix" <> var`
-        if let Pattern::String(prefix) = &base {
-            if self.peek() == &TokenKind::Concatenate
-                && matches!(self.peek_at(1), TokenKind::Variable(_) | TokenKind::DiscardVariable(_))
-            {
-                self.consume(); // `<>`
-                let rest_tok = self.consume().kind;
-                let rest = match rest_tok {
-                    TokenKind::Variable(n) => Pattern::Var(n),
-                    TokenKind::DiscardVariable(n) => Pattern::Discard(n),
-                    _ => unreachable!(),
-                };
-                return Ok(Pattern::StringPrefix {
-                    prefix: prefix.clone(),
-                    rest: Box::new(rest),
-                });
-            }
+        let Pattern::String(prefix) = base else {
+            return Ok(base);
+        };
+        let prefix_alias = if self.peek() == &TokenKind::As
+            && matches!(self.peek_at(1), TokenKind::Variable(_))
+            && self.peek_at(2) == &TokenKind::Concatenate
+        {
+            self.consume();
+            Some(self.expect_variable("the string prefix alias")?)
+        } else {
+            None
+        };
+        if !self.skip(&TokenKind::Concatenate) {
+            return Ok(Pattern::String(prefix));
         }
-        Ok(base)
+        let rest = match self.peek().clone() {
+            TokenKind::Variable(name) => Pattern::Var(name),
+            TokenKind::DiscardVariable(name) => Pattern::Discard(name),
+            _ => return Err(self.unexpected("a name after the string prefix")),
+        };
+        self.consume();
+        Ok(Pattern::StringPrefix {
+            prefix,
+            prefix_alias,
+            rest: Box::new(rest),
+        })
     }
 
     fn parse_base_pattern(&mut self) -> Result<Pattern, ParseError> {
         match self.peek().clone() {
+            TokenKind::Minus => match self.parse_negative_number()? {
+                ConstValue::Int(value) => Ok(Pattern::Int(value)),
+                ConstValue::Float(value) => Ok(Pattern::Float(value)),
+                _ => unreachable!("only number literals can follow a minus here"),
+            },
             TokenKind::Int(_) => Ok(Pattern::Int(int_from_token(self.consume().kind))),
             TokenKind::Float(_, _) => Ok(Pattern::Float(float_from_token(self.consume().kind))),
             TokenKind::String(_) => Ok(Pattern::String(string_from_token(self.consume().kind))),
@@ -1633,17 +1726,18 @@ impl Parser {
                             rest = Some(Box::new(Pattern::Discard("_".into())));
                         }
                         // The spread must be the last element.
+                        self.skip(&TokenKind::Comma);
                         if self.peek() != &TokenKind::CloseSquare {
                             return Err(self.unexpected("`]` after the list spread"));
                         }
                         break;
                     }
-                    elements.push(self.parse_pattern()?);
+                    elements.push(self.parse_as_pattern()?);
                     if !self.skip(&TokenKind::Comma) {
                         break; // `]` is consumed below.
                     }
                 }
-                self.consume(); // `]`
+                self.expect(&TokenKind::CloseSquare, "`]` after the list")?;
 
                 Ok(Pattern::List { elements, rest })
             }
@@ -1655,19 +1749,13 @@ impl Parser {
                     if self.peek() == &TokenKind::CloseParen {
                         break;
                     }
-                    elements.push(self.parse_pattern()?);
+                    elements.push(self.parse_as_pattern()?);
                     if self.skip(&TokenKind::Comma) {
                         continue;
                     }
-                    // Single-element tuples require a trailing comma.
-                    if elements.len() < 2 {
-                        return Err(self.unexpected(
-                            "a `,` after the single tuple element (e.g. `#(1,)`)",
-                        ));
-                    }
                     break;
                 }
-                self.consume(); // `)`
+                self.expect(&TokenKind::CloseParen, "`)` after the tuple pattern")?;
 
                 Ok(Pattern::Tuple(elements))
             }
@@ -1676,7 +1764,7 @@ impl Parser {
                 Ok(Pattern::BitArray(ba))
             }
             other => Err(self.error_at(
-                &self.current_token(),
+                self.current_token(),
                 format!("expected a pattern, found {}", other.describe()),
             )),
         }
@@ -1696,6 +1784,7 @@ impl Parser {
                 // `..` discards the remaining fields (must be last).
                 if self.skip(&TokenKind::TwoDots) {
                     args.push(PatternArg::DiscardRest);
+                    self.skip(&TokenKind::Comma);
                     if self.peek() != &TokenKind::CloseParen {
                         return Err(self.unexpected("`)` after `..` in the pattern"));
                     }
@@ -1711,7 +1800,12 @@ impl Parser {
                 } else {
                     None
                 };
-                let pattern = Box::new(self.parse_pattern()?);
+                let pattern = Box::new(match (&label, self.peek()) {
+                    (Some(label), TokenKind::Comma | TokenKind::CloseParen) => {
+                        Pattern::Var(label.clone())
+                    }
+                    _ => self.parse_as_pattern()?,
+                });
                 args.push(match label {
                     Some(label) => PatternArg::Named { label, pattern },
                     None => PatternArg::Unnamed(pattern),
@@ -1720,7 +1814,7 @@ impl Parser {
                     break; // `)` is consumed below.
                 }
             }
-            self.consume(); // `)`
+            self.expect(&TokenKind::CloseParen, "`)` after the constructor pattern")?;
         }
         Ok(Pattern::Constructor(
             ConstructorRef { module, name },
@@ -1854,6 +1948,21 @@ impl Parser {
 
     fn parse_guard_value(&mut self) -> Result<Guard, ParseError> {
         match self.peek().clone() {
+            TokenKind::Minus => match self.parse_negative_number()? {
+                ConstValue::Int(value) => Ok(Guard::Int(value)),
+                ConstValue::Float(value) => Ok(Guard::Float(value)),
+                _ => unreachable!("only number literals can follow a minus here"),
+            },
+            TokenKind::Bang => {
+                self.consume();
+                Ok(Guard::Not(Box::new(self.parse_guard_value()?)))
+            }
+            TokenKind::OpenBlock => {
+                self.consume();
+                let guard = self.parse_guard()?;
+                self.expect(&TokenKind::CloseBlock, "`}` after the grouped guard")?;
+                Ok(guard)
+            }
             TokenKind::Int(_) => Ok(Guard::Int(int_from_token(self.consume().kind))),
             TokenKind::Float(_, _) => Ok(Guard::Float(float_from_token(self.consume().kind))),
             TokenKind::String(_) => Ok(Guard::String(string_from_token(self.consume().kind))),
@@ -1875,14 +1984,18 @@ impl Parser {
                 while self.peek() == &TokenKind::Dot {
                     self.consume();
                     let label = match self.peek().clone() {
+                        TokenKind::Int(_) => int_from_token(self.consume().kind).raw,
                         TokenKind::Variable(label) => {
                             self.consume();
                             label
                         }
                         other => {
                             return Err(self.error_at(
-                                &self.current_token(),
-                                format!("expected a field name in the guard, found {}", other.describe()),
+                                self.current_token(),
+                                format!(
+                                    "expected a field name in the guard, found {}",
+                                    other.describe()
+                                ),
                             ))
                         }
                     };
@@ -1913,7 +2026,7 @@ impl Parser {
                 Ok(guard)
             }
             other => Err(self.error_at(
-                &self.current_token(),
+                self.current_token(),
                 format!(
                     "expected a guard expression (literals, variables and operators), found {}",
                     other.describe()
@@ -1928,6 +2041,10 @@ impl Parser {
 
     fn parse_type_annotation(&mut self) -> Result<TypeAnnotation, ParseError> {
         match self.peek().clone() {
+            TokenKind::DiscardVariable(_) => {
+                self.consume();
+                Ok(TypeAnnotation::Hole)
+            }
             TokenKind::Fn => {
                 self.consume();
                 self.expect(&TokenKind::OpenParen, "`(` after `fn` in the type annotation")?;
@@ -2028,7 +2145,7 @@ impl Parser {
                 })
             }
             other => Err(self.error_at(
-                &self.current_token(),
+                self.current_token(),
                 format!("expected a type annotation, found {}", other.describe()),
             )),
         }

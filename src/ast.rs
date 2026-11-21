@@ -32,10 +32,19 @@ impl Span {
 
     /// The 1-based (line, column) of `start` within `source`.
     pub fn line_col(&self, source: &str) -> (u32, u32) {
-        let pos = self.start.min(source.len());
+        let mut pos = self.start.min(source.len());
+        while !source.is_char_boundary(pos) {
+            pos -= 1;
+        }
         let prefix = &source[..pos];
         let line = prefix.matches('\n').count() as u32 + 1;
-        let col = prefix.rfind('\n').map(|i| pos - i - 1).unwrap_or(pos) as u32 + 1;
+        let col = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count() as u32
+            + 1;
         (line, col)
     }
 }
@@ -123,6 +132,7 @@ impl Definition {
 pub enum Attribute {
     External(ExternalFn),
     Deprecated(String),
+    Internal,
 }
 
 /// The target of an `@external(lang, "module", "function")` attribute.
@@ -240,6 +250,11 @@ pub enum ConstValue {
     Nil,
     /// A reference to another constant in the same module.
     Var(String),
+    Qualified {
+        module: String,
+        name: String,
+    },
+    Concat(Box<ConstValue>, Box<ConstValue>),
     /// A record constructor with its arguments, e.g. `Point(x: 1, y: 2)`.
     Constructor(ConstructorRef, Vec<ConstArg>),
     List {
@@ -280,6 +295,25 @@ pub enum UnqualifiedImport {
     Value(String),
     /// A type imported with the `type` keyword.
     Type(String),
+    ValueAlias {
+        name: String,
+        alias: String,
+    },
+    TypeAlias {
+        name: String,
+        alias: String,
+    },
+}
+
+impl UnqualifiedImport {
+    pub(crate) fn names(&self) -> (&str, &str, bool) {
+        match self {
+            Self::Value(name) => (name, name, false),
+            Self::Type(name) => (name, name, true),
+            Self::ValueAlias { name, alias } => (name, alias, false),
+            Self::TypeAlias { name, alias } => (name, alias, true),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -372,13 +406,14 @@ pub enum Expr {
     // -- Misc ---------------------------------------------------------------
     /// The `echo` debug print expression.
     Echo(Box<Expression>),
+    EchoPipe,
     /// `todo` with an optional message: `todo as "not done yet"`.
     Todo {
-        message: Option<String>,
+        message: Option<Box<Expression>>,
     },
     /// `panic` with an optional message: `panic as "impossible!"`.
     Panic {
-        message: Option<String>,
+        message: Option<Box<Expression>>,
     },
 
     // -- Operators ----------------------------------------------------------
@@ -432,8 +467,10 @@ pub enum CallArg {
 /// An anonymous function literal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnLiteral {
-    /// Parameter names (no type annotations are allowed on fn literals).
+    /// Parameter names and their optional type annotations.
     pub args: Vec<String>,
+    pub annotations: Vec<Option<TypeAnnotation>>,
+    pub return_annotation: Option<TypeAnnotation>,
     pub body: Box<Expression>,
 }
 
@@ -449,6 +486,11 @@ pub struct Capture {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CaptureArg {
     Value(Expression),
+    Labelled {
+        label: String,
+        value: Expression,
+    },
+    LabelledPlaceholder(String),
     /// The `_` placeholder.
     Placeholder,
 }
@@ -479,9 +521,21 @@ pub struct Case {
 pub struct Clause {
     /// One pattern per subject.
     pub patterns: Vec<Pattern>,
+    pub alternatives: Vec<Vec<Pattern>>,
     pub guard: Option<Guard>,
     pub expression: Expression,
     pub span: Span,
+}
+
+impl Clause {
+    pub(crate) fn pattern_groups(&self) -> Vec<&[Pattern]> {
+        if let [Pattern::Alternative(patterns)] = self.patterns.as_slice() {
+            return patterns.iter().map(std::slice::from_ref).collect();
+        }
+        std::iter::once(self.patterns.as_slice())
+            .chain(self.alternatives.iter().map(Vec::as_slice))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,16 +554,17 @@ pub struct Let {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LetAssert {
     pub pattern: Pattern,
+    pub annotation: Option<TypeAnnotation>,
     pub value: Box<Expression>,
     /// The message from `as "..."`, if any.
-    pub message: Option<String>,
+    pub message: Option<Box<Expression>>,
 }
 
 /// A boolean assertion: `assert expr as "..."`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assert {
     pub value: Box<Expression>,
-    pub message: Option<String>,
+    pub message: Option<Box<Expression>>,
 }
 
 /// A `use` expression: `use x, y <- call` with the rest of the block as body.
@@ -517,6 +572,7 @@ pub struct Assert {
 pub struct Use {
     /// The patterns bound by the callback (one per argument).
     pub patterns: Vec<Pattern>,
+    pub annotations: Vec<Option<TypeAnnotation>>,
     /// The expression on the right hand side of `<-`.
     pub call: Box<Expression>,
     /// The remainder of the enclosing block.
@@ -584,6 +640,7 @@ pub enum Pattern {
     /// A string prefix pattern: `"Hello, " <> name`.
     StringPrefix {
         prefix: String,
+        prefix_alias: Option<String>,
         rest: Box<Pattern>,
     },
 
@@ -637,6 +694,7 @@ pub enum Guard {
     Bool(bool),
     Nil,
     Var(String),
+    Not(Box<Guard>),
     /// Field access in a guard: `x.name`.
     FieldAccess {
         base: Box<Guard>,
@@ -654,6 +712,39 @@ pub enum Guard {
     },
 }
 
+impl Guard {
+    pub(crate) fn to_expression(&self, span: Span) -> Expression {
+        let boxed = |guard: &Self| Box::new(guard.to_expression(span));
+        let expr = match self {
+            Self::Int(value) => Expr::Int(value.clone()),
+            Self::Float(value) => Expr::Float(value.clone()),
+            Self::String(value) => Expr::String(value.clone()),
+            Self::Bool(value) => Expr::Bool(*value),
+            Self::Nil => Expr::Nil,
+            Self::Var(name) => Expr::Var(name.clone()),
+            Self::Not(guard) => Expr::Not(boxed(guard)),
+            Self::FieldAccess { base, label } => Expr::FieldAccess {
+                base: boxed(base),
+                label: label.clone(),
+            },
+            Self::Call { fun, args } => Expr::Call(Call {
+                fun: boxed(fun),
+                args: args
+                    .iter()
+                    .map(|arg| CallArg::Value(arg.to_expression(span)))
+                    .collect(),
+                fun_span: span,
+            }),
+            Self::Binary { op, lhs, rhs } => Expr::Binary {
+                op: *op,
+                lhs: boxed(lhs),
+                rhs: boxed(rhs),
+            },
+        };
+        Expression { expr, span }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Types (annotations)
 // ---------------------------------------------------------------------------
@@ -662,6 +753,7 @@ pub enum Guard {
 /// `#(Int, Bool)` or `BitArray(8, 8)`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeAnnotation {
+    Hole,
     /// A named type (or a type variable when the name is lowercase).
     Named {
         /// Module qualifier for qualified types, e.g. `bytes_tree.BytesTree`.

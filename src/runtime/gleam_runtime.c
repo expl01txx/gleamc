@@ -27,6 +27,10 @@ GValue g_int(int64_t value) {
   return result;
 }
 
+GValue g_int_from_bits(uint64_t value) {
+  return g_int(value <= INT64_MAX ? (int64_t)value : -1 - (int64_t)(UINT64_MAX - value));
+}
+
 GValue g_float(double value) {
   GValue result = {.tag = G_FLOAT};
   result.as.floating = value;
@@ -94,14 +98,333 @@ GValue g_record(const char *tag, size_t length, GValue *fields) {
   return result;
 }
 
-GValue g_bytes(size_t length, const unsigned char *data) {
-  GBytes *bytes = allocate(sizeof(GBytes) + length);
-  bytes->header.refs = 1;
-  bytes->length = length;
-  memcpy(bytes->data, data, length);
+static size_t bit_bytes(size_t count) {
+  return count / 8 + (count % 8 != 0);
+}
+
+static GValue make_bits(size_t length, const unsigned char *data) {
+  size_t bytes = bit_bytes(length);
+  GBytes *bits = allocate(sizeof(GBytes) + bytes);
+  bits->header.refs = 1;
+  bits->bit_length = length;
+  if (bytes) memcpy(bits->data, data, bytes);
   GValue result = {.tag = G_BYTES};
-  result.as.pointer = bytes;
+  result.as.pointer = bits;
   return result;
+}
+
+GValue g_bytes(size_t length, const unsigned char *data) {
+  if (length > SIZE_MAX / 8) g_panic("bit array too large", __FILE__, __LINE__);
+  return make_bits(length * 8, data);
+}
+
+static unsigned bit_at(const unsigned char *data, size_t index) {
+  return (data[index / 8] >> (7 - index % 8)) & 1u;
+}
+
+static void bit_reserve(GBitBuilder *builder, size_t count) {
+  if (count > SIZE_MAX - builder->length)
+    g_panic("bit array too large", __FILE__, __LINE__);
+  size_t needed = bit_bytes(builder->length + count);
+  if (needed <= builder->capacity) return;
+  size_t capacity = builder->capacity * 2;
+  if (capacity < needed) capacity = needed;
+  unsigned char *data = realloc(builder->data, capacity);
+  if (!data) g_panic("out of memory", __FILE__, __LINE__);
+  memset(data + builder->capacity, 0, capacity - builder->capacity);
+  builder->data = data;
+  builder->capacity = capacity;
+}
+
+static void bit_push(GBitBuilder *builder, unsigned bit) {
+  size_t index = builder->length++;
+  builder->data[index / 8] |= (unsigned char)(bit << (7 - index % 8));
+}
+
+static void bit_copy(GBitBuilder *builder, const unsigned char *data,
+                     size_t offset, size_t count) {
+  bit_reserve(builder, count);
+  if (builder->length % 8 == 0 && offset % 8 == 0 && count % 8 == 0) {
+    if (count) memcpy(builder->data + builder->length / 8, data + offset / 8, count / 8);
+    builder->length += count;
+    return;
+  }
+  for (size_t i = 0; i < count; ++i) bit_push(builder, bit_at(data, offset + i));
+}
+
+static int bit_little_endian(GBitEndian endian) {
+  const uint16_t one = 1;
+  return endian == G_BIT_LITTLE ||
+         (endian == G_BIT_NATIVE && *(const unsigned char *)&one == 1);
+}
+
+static size_t bit_shift(size_t index, size_t width, int little) {
+  if (!little) return width - index - 1;
+  size_t base = index - index % 8;
+  size_t chunk = width - base < 8 ? width - base : 8;
+  return base + chunk - index % 8 - 1;
+}
+
+static void bit_write_number(GBitBuilder *builder, uint64_t value, size_t width,
+                             int little, unsigned fill) {
+  bit_reserve(builder, width);
+  for (size_t i = 0; i < width; ++i) {
+    size_t shift = bit_shift(i, width, little);
+    bit_push(builder, shift < 64 ? (unsigned)((value >> shift) & 1u) : fill);
+  }
+}
+
+static uint64_t bit_read_number(const unsigned char *data, size_t offset,
+                                size_t width, int little) {
+  uint64_t result = 0;
+  size_t first = !little && width > 64 ? width - 64 : 0;
+  size_t limit = little && width > 64 ? 64 : width;
+  for (size_t i = first; i < limit; ++i)
+    result |= (uint64_t)bit_at(data, offset + i) << bit_shift(i, width, little);
+  return result;
+}
+
+static int bit_width(GValue size, size_t unit, size_t fallback, size_t *width) {
+  if (size.tag == G_NIL) {
+    *width = fallback;
+    return 1;
+  }
+  if (size.tag != G_INT || size.as.integer < 0 ||
+      (uint64_t)size.as.integer > SIZE_MAX / unit) return 0;
+  *width = (size_t)size.as.integer * unit;
+  return 1;
+}
+
+static size_t utf8_decode(const unsigned char *data, size_t length, size_t index,
+                          uint32_t *codepoint);
+
+static int unicode_scalar(uint32_t cp) {
+  return cp <= 0x10FFFF && (cp < 0xD800 || cp > 0xDFFF);
+}
+
+static size_t bit_utf8_encode(uint32_t cp, unsigned char *data) {
+  if (cp < 0x80) {
+    data[0] = (unsigned char)cp;
+    return 1;
+  }
+  size_t width = cp < 0x800 ? 2 : (cp < 0x10000 ? 3 : 4);
+  for (size_t i = width - 1; i > 0; --i) {
+    data[i] = (unsigned char)(0x80u | (cp & 0x3Fu));
+    cp >>= 6;
+  }
+  data[0] = (unsigned char)((0xFFu << (8 - width)) | cp);
+  return width;
+}
+
+static void bit_write_unicode(GBitBuilder *builder, uint32_t cp, GBitKind kind, int little) {
+  if (!unicode_scalar(cp)) g_panic("invalid Unicode codepoint", __FILE__, __LINE__);
+  if (kind == G_BIT_CODEPOINT8 || kind == G_BIT_UTF8) {
+    unsigned char bytes[4];
+    size_t width = bit_utf8_encode(cp, bytes);
+    bit_copy(builder, bytes, 0, width * 8);
+  } else if (kind == G_BIT_CODEPOINT32 || kind == G_BIT_UTF32) {
+    bit_write_number(builder, cp, 32, little, 0);
+  } else if (cp < 0x10000) {
+    bit_write_number(builder, cp, 16, little, 0);
+  } else {
+    cp -= 0x10000;
+    bit_write_number(builder, 0xD800u | (cp >> 10), 16, little, 0);
+    bit_write_number(builder, 0xDC00u | (cp & 0x3FFu), 16, little, 0);
+  }
+}
+
+static size_t bit_read_unicode(const GBytes *bits, size_t offset, GBitKind kind,
+                               int little, uint32_t *cp) {
+  size_t remaining = bits->bit_length - offset;
+  if (kind == G_BIT_CODEPOINT8) {
+    unsigned char bytes[4], canonical[4];
+    size_t available = remaining / 8 < 4 ? remaining / 8 : 4;
+    for (size_t i = 0; i < available; ++i)
+      bytes[i] = (unsigned char)bit_read_number(bits->data, offset + 8 * i, 8, 0);
+    size_t used = utf8_decode(bytes, available, 0, cp);
+    if (used == 0 || !unicode_scalar(*cp) || bit_utf8_encode(*cp, canonical) != used ||
+        memcmp(bytes, canonical, used) != 0) return 0;
+    return used * 8;
+  }
+  size_t width = kind == G_BIT_CODEPOINT32 ? 32 : 16;
+  if (remaining < width) return 0;
+  *cp = (uint32_t)bit_read_number(bits->data, offset, width, little);
+  if (width == 16 && *cp >= 0xD800 && *cp <= 0xDBFF) {
+    if (remaining < 32) return 0;
+    uint32_t low = (uint32_t)bit_read_number(bits->data, offset + 16, 16, little);
+    if (low < 0xDC00 || low > 0xDFFF) return 0;
+    *cp = 0x10000 + ((*cp - 0xD800) << 10) + low - 0xDC00;
+    width = 32;
+  }
+  return unicode_scalar(*cp) ? width : 0;
+}
+
+static uint16_t bit_encode_half(double value) {
+  uint64_t raw;
+  memcpy(&raw, &value, sizeof raw);
+  uint16_t sign = (uint16_t)((raw >> 48) & 0x8000u);
+  int exponent = (int)((raw >> 52) & 0x7FFu);
+  uint64_t fraction = raw & UINT64_C(0xFFFFFFFFFFFFF);
+  if (exponent == 0x7FF)
+    return (uint16_t)(sign | (fraction ? 0x7E00u : 0x7C00u));
+  int half_exponent = exponent - 1023 + 15;
+  if (half_exponent >= 31) return (uint16_t)(sign | 0x7C00u);
+  if (half_exponent < -10) return sign;
+  unsigned shift = 42;
+  if (half_exponent <= 0) {
+    shift += (unsigned)(1 - half_exponent);
+    fraction |= UINT64_C(1) << 52;
+    half_exponent = 0;
+  }
+  uint64_t rounded = fraction >> shift;
+  uint64_t remainder = fraction & ((UINT64_C(1) << shift) - 1);
+  uint64_t midpoint = UINT64_C(1) << (shift - 1);
+  if (remainder > midpoint || (remainder == midpoint && (rounded & 1u))) ++rounded;
+  return (uint16_t)(sign | (((uint64_t)half_exponent << 10) + rounded));
+}
+
+static double bit_decode_half(uint16_t value) {
+  uint64_t sign = (uint64_t)(value & 0x8000u) << 48;
+  unsigned fraction = value & 0x3FFu;
+  int exponent = (value >> 10) & 0x1F;
+  uint64_t raw = sign;
+  if (exponent == 31) {
+    raw |= UINT64_C(0x7FF) << 52;
+    raw |= (uint64_t)fraction << 42;
+  } else if (exponent || fraction) {
+    if (exponent == 0) {
+      exponent = 1;
+      while ((fraction & 0x400u) == 0) {
+        fraction <<= 1;
+        --exponent;
+      }
+      fraction &= 0x3FFu;
+    }
+    raw |= (uint64_t)(exponent + 1023 - 15) << 52;
+    raw |= (uint64_t)fraction << 42;
+  }
+  double result;
+  memcpy(&result, &raw, sizeof raw);
+  return result;
+}
+
+void g_bits_append(GBitBuilder *builder, GValue value, GBitKind kind,
+                   GBitEndian endian, GValue size, size_t unit) {
+  int little = bit_little_endian(endian);
+  size_t width;
+  if (kind == G_BIT_BITS || kind == G_BIT_BYTES) {
+    if (value.tag != G_BYTES) g_type_error("BitArray", value, __FILE__, __LINE__);
+    GBytes *bits = value.as.pointer;
+    if (!bit_width(size, unit, bits->bit_length, &width) ||
+        width > bits->bit_length || (kind == G_BIT_BYTES && width % 8 != 0))
+      g_panic("invalid bit array segment size", __FILE__, __LINE__);
+    bit_copy(builder, bits->data, 0, width);
+  } else if (kind == G_BIT_INT) {
+    if (value.tag != G_INT) g_type_error("Int", value, __FILE__, __LINE__);
+    if (!bit_width(size, unit, 8, &width)) g_panic("invalid bit array size", __FILE__, __LINE__);
+    bit_write_number(builder, (uint64_t)value.as.integer, width, little, value.as.integer < 0);
+  } else if (kind == G_BIT_FLOAT) {
+    if (value.tag != G_FLOAT) g_type_error("Float", value, __FILE__, __LINE__);
+    if (!bit_width(size, unit, 64, &width) || (width != 16 && width != 32 && width != 64))
+      g_panic("bit array floats require 16, 32, or 64 bits", __FILE__, __LINE__);
+    uint64_t encoded;
+    if (width == 16) {
+      encoded = bit_encode_half(value.as.floating);
+    } else if (width == 32) {
+      float number = (float)value.as.floating;
+      uint32_t small;
+      memcpy(&small, &number, sizeof small);
+      encoded = small;
+    } else {
+      memcpy(&encoded, &value.as.floating, sizeof encoded);
+    }
+    bit_write_number(builder, encoded, width, little, 0);
+  } else if (kind == G_BIT_UTF8 || kind == G_BIT_UTF16 || kind == G_BIT_UTF32) {
+    if (value.tag != G_STRING) g_type_error("String", value, __FILE__, __LINE__);
+    GString *string = value.as.pointer;
+    const unsigned char *data = (const unsigned char *)string->data;
+    if (kind == G_BIT_UTF8) {
+      bit_copy(builder, data, 0, string->length * 8);
+    } else {
+      for (size_t i = 0; i < string->length;) {
+        uint32_t cp;
+        i += utf8_decode(data, string->length, i, &cp);
+        bit_write_unicode(builder, cp, kind, little);
+      }
+    }
+  } else {
+    if (value.tag != G_INT) g_type_error("UtfCodepoint", value, __FILE__, __LINE__);
+    bit_write_unicode(builder, (uint32_t)value.as.integer, kind, little);
+  }
+}
+
+GValue g_bits_finish(GBitBuilder *builder) {
+  GValue value = make_bits(builder->length, builder->data);
+  free(builder->data);
+  return value;
+}
+
+int g_bits_take(GValue value, size_t *offset, GBitKind kind, GBitEndian endian,
+                GValue size, size_t unit, int is_signed, GValue *result) {
+  if (value.tag != G_BYTES) return 0;
+  GBytes *bits = value.as.pointer;
+  int little = bit_little_endian(endian);
+  if (*offset > bits->bit_length) return 0;
+  size_t remaining = bits->bit_length - *offset;
+  size_t width;
+  if (kind == G_BIT_CODEPOINT8 || kind == G_BIT_CODEPOINT16 || kind == G_BIT_CODEPOINT32) {
+    uint32_t cp;
+    width = bit_read_unicode(bits, *offset, kind, little, &cp);
+    if (width == 0) return 0;
+    *result = g_int(cp);
+  } else {
+    size_t fallback = kind == G_BIT_INT ? 8 : (kind == G_BIT_FLOAT ? 64 : remaining);
+    if (!bit_width(size, unit, fallback, &width) || width > remaining) return 0;
+    if (kind == G_BIT_BITS || kind == G_BIT_BYTES) {
+      if (kind == G_BIT_BYTES && width % 8 != 0) return 0;
+      GBitBuilder builder = {0};
+      bit_copy(&builder, bits->data, *offset, width);
+      *result = g_bits_finish(&builder);
+    } else if (kind == G_BIT_INT) {
+      uint64_t raw = bit_read_number(bits->data, *offset, width, little);
+      if (is_signed && width > 0 && width < 64 && (raw & (UINT64_C(1) << (width - 1))))
+        raw |= UINT64_MAX << width;
+      *result = g_int_from_bits(raw);
+    } else if (kind == G_BIT_FLOAT && (width == 16 || width == 32 || width == 64)) {
+      uint64_t raw = bit_read_number(bits->data, *offset, width, little);
+      double number;
+      if (width == 16) {
+        number = bit_decode_half((uint16_t)raw);
+      } else if (width == 32) {
+        uint32_t small = (uint32_t)raw;
+        float decoded;
+        memcpy(&decoded, &small, sizeof decoded);
+        number = decoded;
+      } else {
+        memcpy(&number, &raw, sizeof number);
+      }
+      *result = g_float(number);
+    } else {
+      return 0;
+    }
+  }
+  *offset += width;
+  return 1;
+}
+
+int g_bits_end(GValue value, size_t offset) {
+  return value.tag == G_BYTES && ((GBytes *)value.as.pointer)->bit_length == offset;
+}
+
+int g_bits_prefix(GValue value, size_t *offset, GValue prefix) {
+  if (value.tag != G_BYTES || prefix.tag != G_BYTES) return 0;
+  GBytes *bits = value.as.pointer;
+  GBytes *expected = prefix.as.pointer;
+  if (*offset > bits->bit_length || expected->bit_length > bits->bit_length - *offset) return 0;
+  for (size_t i = 0; i < expected->bit_length; ++i)
+    if (bit_at(bits->data, *offset + i) != bit_at(expected->data, i)) return 0;
+  *offset += expected->bit_length;
+  return 1;
 }
 
 GValue g_closure_new(GFunction function, size_t arity, size_t capture_count,
@@ -248,8 +571,8 @@ int g_equal(GValue left, GValue right) {
   case G_BYTES: {
     GBytes *a = left.as.pointer;
     GBytes *b = right.as.pointer;
-    return a->length == b->length &&
-           memcmp(a->data, b->data, a->length) == 0;
+    return a->bit_length == b->bit_length &&
+           memcmp(a->data, b->data, bit_bytes(a->bit_length)) == 0;
   }
   case G_CLOSURE:
     return left.as.pointer == right.as.pointer;
@@ -281,18 +604,16 @@ GValue g_string_concat(GValue left, GValue right) {
   return result;
 }
 
-int g_string_equals(GValue value, const char *expected) {
+int g_string_equals_n(GValue value, const char *expected, size_t length) {
   if (value.tag != G_STRING) return 0;
   GString *string = value.as.pointer;
-  size_t length = strlen(expected);
   return string->length == length &&
          memcmp(string->data, expected, length) == 0;
 }
 
-int g_string_starts_with(GValue value, const char *prefix) {
+int g_string_starts_with_n(GValue value, const char *prefix, size_t length) {
   if (value.tag != G_STRING) return 0;
   GString *string = value.as.pointer;
-  size_t length = strlen(prefix);
   return string->length >= length &&
          memcmp(string->data, prefix, length) == 0;
 }
@@ -360,14 +681,15 @@ int g_record_is(GValue record, const char *tag) {
 GValue g_int_divide(GValue left, GValue right) {
   if (left.tag != G_INT) g_type_error("Int", left, __FILE__, __LINE__);
   if (right.tag != G_INT) g_type_error("Int", right, __FILE__, __LINE__);
-  if (right.as.integer == 0) g_panic("division by zero", __FILE__, __LINE__);
+  if (right.as.integer == 0) return g_int(0);
+  if (right.as.integer == -1 && left.as.integer == INT64_MIN) return left;
   return g_int(left.as.integer / right.as.integer);
 }
 
 GValue g_int_modulo(GValue left, GValue right) {
   if (left.tag != G_INT) g_type_error("Int", left, __FILE__, __LINE__);
   if (right.tag != G_INT) g_type_error("Int", right, __FILE__, __LINE__);
-  if (right.as.integer == 0) g_panic("modulo by zero", __FILE__, __LINE__);
+  if (right.as.integer == 0 || right.as.integer == -1) return g_int(0);
   return g_int(left.as.integer % right.as.integer);
 }
 
@@ -441,9 +763,14 @@ static void inspect(FILE *stream, GValue value) {
   case G_BYTES: {
     GBytes *bytes = value.as.pointer;
     fputs("<<", stream);
-    for (size_t i = 0; i < bytes->length; ++i) {
+    for (size_t i = 0; i < bytes->bit_length / 8; ++i) {
       if (i) fputs(", ", stream);
       fprintf(stream, "%u", bytes->data[i]);
+    }
+    size_t tail = bytes->bit_length % 8;
+    if (tail) {
+      if (bytes->bit_length >= 8) fputs(", ", stream);
+      fprintf(stream, "%u:size(%zu)", bytes->data[bytes->bit_length / 8] >> (8 - tail), tail);
     }
     fputs(">>", stream);
     break;
@@ -455,6 +782,16 @@ void g_echo(GValue value, const char *file, int line) {
   fprintf(stderr, "%s:%d\n", file, line);
   inspect(stderr, value);
   fputc('\n', stderr);
+}
+
+_Noreturn void g_panic_value(GValue message, const char *file, int line) {
+  if (message.tag != G_STRING) g_type_error("String", message, file, line);
+  GString *string = message.as.pointer;
+  fprintf(stderr, "%s:%d: ", file, line);
+  fwrite(string->data, 1, string->length, stderr);
+  fputc('\n', stderr);
+  g_release(message);
+  exit(1);
 }
 
 _Noreturn void g_panic(const char *message, const char *file, int line) {

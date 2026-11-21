@@ -4,7 +4,7 @@
 //! These tests are skipped when a C compiler is not available.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 fn cc_available() -> bool {
     Command::new("cc")
@@ -14,9 +14,7 @@ fn cc_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Parse, generate C, compile, and run a Gleam program with the given
-/// command-line arguments and stdin. Returns stdout.
-fn run_gleam_configured(src: &str, name: &str, args: &[&str], stdin: &str) -> String {
+fn execute_gleam(src: &str, name: &str, args: &[&str], stdin: &str) -> Output {
     let module = gleamc::parse(src).expect("should parse");
     let dir = std::env::temp_dir().join(format!("gleam-parser-test-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -56,7 +54,13 @@ fn run_gleam_configured(src: &str, name: &str, args: &[&str], stdin: &str) -> St
             .expect("write stdin");
     }
     drop(child.stdin.take());
-    let run = child.wait_with_output().expect("failed to wait for program");
+    child
+        .wait_with_output()
+        .expect("failed to wait for program")
+}
+
+fn run_gleam_configured(src: &str, name: &str, args: &[&str], stdin: &str) -> String {
+    let run = execute_gleam(src, name, args, stdin);
     assert!(
         run.status.success(),
         "program failed:\n{}",
@@ -371,4 +375,175 @@ fn hello_end_to_end() {
         out == "[\"push 5\", \"push 3\", \"add\", \"print\"]\n",
         "unexpected output:\n{out}"
     );
+}
+
+#[test]
+fn language_features_end_to_end() {
+    if !cc_available() {
+        return;
+    }
+    let run = execute_gleam(include_str!("language_test.gleam"), "language", &[], "");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(run.stdout.is_empty());
+    assert!(stderr.ends_with("\nTrue\n"), "{stderr}");
+}
+
+#[test]
+fn cli_links_source_modules_in_both_output_modes() {
+    if !cc_available() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("gleamc-project-test-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src/nested")).unwrap();
+    std::fs::create_dir_all(root.join("staging")).unwrap();
+    std::fs::write(root.join("staging/main.c"), "existing file").unwrap();
+    std::fs::write(
+        root.join("src/main.gleam"),
+        r#"
+import nested/model.{type Model as Item, Model as Create, describe as show} as models
+import other
+import gleam/io.{println as print_line} as _
+const message = models.prefix <> "!"
+pub fn main() {
+  let item: Item = Create("ok")
+  let answer = other.Model(42)
+  let answer = case answer { other.Model(value) -> value }
+  assert answer == 42
+  print_line(message <> " " <> show(item))
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/nested/model.gleam"),
+        r#"
+pub const prefix = "linked"
+pub type Model { Model(value: String) }
+pub fn describe(model: Model) { model.value }
+fn secret() { "private" }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/other.gleam"),
+        "pub type Model { Model(Int) }",
+    )
+    .unwrap();
+
+    let compile_cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_gleamc"))
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let result = compile_cli(&["src/main.gleam", "-o", "staging"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("staging/main.c")).unwrap(),
+        "existing file"
+    );
+    assert_eq!(std::fs::read_dir(root.join("staging")).unwrap().count(), 1);
+    let run = Command::new(root.join("program")).output().unwrap();
+    assert!(run.status.success());
+    assert_eq!(run.stdout, b"linked! ok\n");
+
+    let result = compile_cli(&["src/main.gleam", "-c", "-o", "standalone"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = Command::new("cc")
+        .current_dir(&root)
+        .args([
+            "-std=c11",
+            "-pedantic",
+            "standalone/main.c",
+            "-o",
+            "standalone/program",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let run = Command::new(root.join("standalone/program"))
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    assert_eq!(run.stdout, b"linked! ok\n");
+
+    std::fs::write(
+        root.join("src/private.gleam"),
+        "import nested/model\npub fn main() { model.secret() }",
+    )
+    .unwrap();
+    let error = gleamc::translate_file(root.join("src/private.gleam"), false).unwrap_err();
+    assert!(error.to_string().contains("has no public value `secret`"));
+
+    std::fs::write(root.join("src/cycle.gleam"), "import other").unwrap();
+    std::fs::write(root.join("src/other.gleam"), "import cycle").unwrap();
+    let error = gleamc::translate_file(root.join("src/cycle.gleam"), false).unwrap_err();
+    assert!(error.to_string().contains("cyclic import"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn panics_report_computed_messages() {
+    if !cc_available() {
+        return;
+    }
+    let cases = [
+        (
+            "panic",
+            "pub fn main() { let message = \"computed\" panic as message }",
+        ),
+        ("todo", "pub fn main() { todo as { \"computed\" } }"),
+        (
+            "assert",
+            "pub fn main() { assert False as { \"computed\" } }",
+        ),
+        (
+            "let-assert",
+            "pub fn main() { let message = \"computed\" let assert [message] = [] as message Nil }",
+        ),
+    ];
+    for (name, source) in cases {
+        let run = execute_gleam(source, name, &[], "");
+        assert_eq!(run.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&run.stderr).ends_with(": computed\n"));
+    }
+}
+
+#[test]
+fn c_external_takes_precedence_over_gleam_fallback() {
+    if !cc_available() {
+        return;
+    }
+    let source = r#"
+@external(c, "runtime", "gleam_int_absolute_value")
+fn absolute(value: Int) -> Int { value }
+
+pub fn main() { assert absolute(-8) == 8 }
+"#;
+    assert_eq!(run_gleam(source, "c-external"), "");
+}
+
+#[test]
+fn incomplete_use_panics_when_its_callback_is_called() {
+    if !cc_available() {
+        return;
+    }
+    let source = "fn run(callback: fn() -> Nil) { callback() } pub fn main() { use <- run() }";
+    let run = execute_gleam(source, "incomplete-use", &[], "");
+    assert_eq!(run.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&run.stderr).ends_with(": todo\n"));
 }

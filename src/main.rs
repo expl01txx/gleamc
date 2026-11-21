@@ -1,6 +1,7 @@
-use gleamc::{translate_standalone, write_c_project};
+use gleamc::{translate_file, write_c_project_file};
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -48,14 +49,6 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let source = match fs::read_to_string(&input) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!("{input}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     if codegen_only {
         // Emit one self-contained C file that can be compiled manually.
         let stem = Path::new(&input)
@@ -63,7 +56,7 @@ fn main() -> ExitCode {
             .and_then(|stem| stem.to_str())
             .unwrap_or("main");
         let c_path = output.join(format!("{stem}.c"));
-        let result = translate_standalone(&source)
+        let result = translate_file(&input, true)
             .map_err(|error| error.to_string())
             .and_then(|c_source| {
                 fs::create_dir_all(&output).map_err(|error| error.to_string())?;
@@ -79,7 +72,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                eprintln!("{input}: {error}");
+                eprintln!("{error}");
                 ExitCode::FAILURE
             }
         };
@@ -87,15 +80,16 @@ fn main() -> ExitCode {
 
     // Default: generate C, compile it with cc, then clean up the staging
     // directory.
-    let module = match gleamc::parse(&source) {
-        Ok(module) => module,
+    let output = match staging_directory(&output) {
+        Ok(output) => output,
         Err(error) => {
-            eprintln!("{input}: {error}");
+            eprintln!("{}: {error}", output.display());
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = write_c_project(&source, &module, &output) {
-        eprintln!("{input}: {error}");
+    if let Err(error) = write_c_project_file(&input, &output) {
+        let _ = fs::remove_dir(&output);
+        eprintln!("{error}");
         return ExitCode::FAILURE;
     }
 
@@ -122,7 +116,7 @@ fn main() -> ExitCode {
 
     match compile {
         Ok(result) if result.status.success() => {
-            if let Err(error) = fs::remove_dir_all(&output) {
+            if let Err(error) = remove_staging_files(&output) {
                 eprintln!("note: could not remove {}: {error}", output.display());
             } else if release {
                 println!(
@@ -160,4 +154,33 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn staging_directory(output: &Path) -> io::Result<PathBuf> {
+    match fs::create_dir(output) {
+        Ok(()) => return Ok(output.to_owned()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && output.is_dir() => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(output)?;
+            return Ok(output.to_owned());
+        }
+        Err(error) => return Err(error),
+    }
+
+    for suffix in 0.. {
+        let staging = output.join(format!("gleamc-{}-{suffix}", std::process::id()));
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("unique staging directory")
+}
+
+fn remove_staging_files(output: &Path) -> io::Result<()> {
+    for file in ["main.c", "gleam_runtime.c", "gleam_runtime.h"] {
+        fs::remove_file(output.join(file))?;
+    }
+    fs::remove_dir(output)
 }

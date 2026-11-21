@@ -169,12 +169,12 @@ pub fn main() {
 
 #[test]
 fn float_literals() {
-    let m = ok("pub fn main() { 3.14 }\n");
+    let m = ok("pub fn main() { 3.125 }\n");
     match &m.definitions[0] {
         Definition::Fn(f) => match single_body(f) {
             Expr::Float(fl) => {
-                assert!((fl.value - 3.14).abs() < f64::EPSILON);
-                assert_eq!(fl.raw, "3.14");
+                assert!((fl.value - 3.125).abs() < f64::EPSILON);
+                assert_eq!(fl.raw, "3.125");
             }
             other => panic!("{other:?}"),
         },
@@ -735,7 +735,7 @@ pub fn main(s: String) {
     match &m.definitions[0] {
         Definition::Fn(f) => match single_body(f) {
             Expr::Case(c) => match &c.clauses[0].patterns[0] {
-                Pattern::StringPrefix { prefix, rest } => {
+                Pattern::StringPrefix { prefix, rest, .. } => {
                     assert_eq!(prefix, "Hello, ");
                     if let Pattern::Var(v) = &**rest {
                         assert_eq!(v, "name");
@@ -1285,13 +1285,17 @@ pub fn main(x: Int) {
             Expr::Case(c) => {
                 match &c.clauses[0].expression.expr {
                     Expr::Todo { message } => {
-                        assert_eq!(message.as_deref(), Some("zero not allowed"));
+                        assert!(
+                            matches!(message.as_deref().map(|expr| &expr.expr), Some(Expr::String(message)) if message == "zero not allowed")
+                        );
                     }
                     other => panic!("{other:?}"),
                 }
                 match &c.clauses[1].expression.expr {
                     Expr::Panic { message } => {
-                        assert_eq!(message.as_deref(), Some("impossible!"));
+                        assert!(
+                            matches!(message.as_deref().map(|expr| &expr.expr), Some(Expr::String(message)) if message == "impossible!")
+                        );
                     }
                     other => panic!("{other:?}"),
                 }
@@ -1318,7 +1322,9 @@ pub fn main(items: List(Int)) {
             assert_eq!(stmts.len(), 2);
             match &stmts[0].expr {
                 Expr::LetAssert(la) => {
-                    assert_eq!(la.message.as_deref(), Some("List should not be empty"));
+                    assert!(
+                        matches!(la.message.as_deref().map(|expr| &expr.expr), Some(Expr::String(message)) if message == "List should not be empty")
+                    );
                     if let Pattern::List { elements, rest } = &la.pattern {
                         assert_eq!(elements.len(), 1);
                         assert!(rest.is_some());
@@ -1352,7 +1358,9 @@ pub fn main() {
             }
             match &block[1].expr {
                 Expr::Assert(a) => {
-                    assert_eq!(a.message.as_deref(), Some("Addition should be commutative"));
+                    assert!(
+                        matches!(a.message.as_deref().map(|expr| &expr.expr), Some(Expr::String(message)) if message == "Addition should be commutative")
+                    );
                 }
                 other => panic!("{other:?}"),
             }
@@ -1617,7 +1625,7 @@ pub type Shape {
   Rectangle(width: Float, height: Float)
 }
 
-pub const pi = 3.14159
+pub const pi = 3.125159
 
 /// Compute the area of a shape.
 pub fn area(shape: Shape) -> Float {
@@ -1831,4 +1839,50 @@ fn f2(a: Int, b: Int) -> Int { a + b }
         },
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn dotted_import_items_and_aliases() {
+    let module =
+        ok("import project/models.{new as make, type Model as Item, Model as Build,} as m");
+    let Definition::Import(import) = &module.definitions[0] else {
+        panic!("expected an import");
+    };
+    assert_eq!(import.alias.as_deref(), Some("m"));
+    assert_eq!(
+        import.unqualified,
+        [
+            UnqualifiedImport::ValueAlias {
+                name: "new".into(),
+                alias: "make".into()
+            },
+            UnqualifiedImport::TypeAlias {
+                name: "Model".into(),
+                alias: "Item".into()
+            },
+            UnqualifiedImport::ValueAlias {
+                name: "Model".into(),
+                alias: "Build".into()
+            },
+        ],
+    );
+}
+
+#[test]
+fn bit_array_requires_closing_delimiter() {
+    err("pub fn main() { <<1 }");
+}
+
+#[test]
+fn accepts_single_element_tuples_and_float_literals_with_a_trailing_point() {
+    ok("const tuple = #(1.) pub fn main() -> #(Float) { #(tuple.0) }");
+    ok("pub fn main() { #(1) }");
+}
+
+#[test]
+fn rejects_missing_delimiters_and_nonfinal_spreads() {
+    err("const malformed = [1,");
+    err("pub fn f() { [1, ..[2], 3] }");
+    err("pub fn f() { #(1 }");
+    err("pub fn f() { f(1 }");
 }

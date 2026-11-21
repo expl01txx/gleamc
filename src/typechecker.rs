@@ -13,7 +13,9 @@
 //! (first match wins).
 
 use crate::ast::*;
+use crate::bit_array::{SegmentKind, SegmentOptions};
 use crate::codegen::is_stdlib_module;
+use crate::dependencies;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -138,13 +140,44 @@ impl fmt::Display for Type {
 }
 
 // Convenience constructors for the built-in types.
-fn t_int() -> Type { Type::app("Int") }
-fn t_float() -> Type { Type::app("Float") }
-fn t_bool() -> Type { Type::app("Bool") }
-fn t_string() -> Type { Type::app("String") }
-fn t_nil() -> Type { Type::app("Nil") }
-fn t_list(elem: Type) -> Type { Type::app_args(None, "List", vec![elem]) }
-fn t_fn(args: Vec<Type>, ret: Type) -> Type { Type::Fn(args, Box::new(ret)) }
+fn t_bits() -> Type {
+    Type::BitArray {
+        size: None,
+        unit: None,
+    }
+}
+
+fn bit_segment_type(kind: SegmentKind) -> Type {
+    match kind {
+        SegmentKind::Int => t_int(),
+        SegmentKind::Float => t_float(),
+        SegmentKind::Bits | SegmentKind::Bytes => t_bits(),
+        SegmentKind::Text(_) => t_string(),
+        SegmentKind::Codepoint(_) => Type::app("UtfCodepoint"),
+    }
+}
+
+fn t_int() -> Type {
+    Type::app("Int")
+}
+fn t_float() -> Type {
+    Type::app("Float")
+}
+fn t_bool() -> Type {
+    Type::app("Bool")
+}
+fn t_string() -> Type {
+    Type::app("String")
+}
+fn t_nil() -> Type {
+    Type::app("Nil")
+}
+fn t_list(elem: Type) -> Type {
+    Type::app_args(None, "List", vec![elem])
+}
+fn t_fn(args: Vec<Type>, ret: Type) -> Type {
+    Type::Fn(args, Box::new(ret))
+}
 
 // ---------------------------------------------------------------------------
 // Unification
@@ -355,6 +388,7 @@ struct Ctor {
 }
 
 struct FnInfo {
+    generalized: bool,
     labels: Vec<Option<String>>,
     ty: Type,
 }
@@ -370,16 +404,22 @@ struct Env {
     /// Import aliases: `alias -> module path`.
     imports: HashMap<String, String>,
     /// Unqualified function imports: `name -> module path`.
-    unqualified_fns: HashMap<String, String>,
+    unqualified_fns: HashMap<String, (String, String)>,
     /// Unqualified type imports: `name -> module path`.
-    unqualified_types: HashMap<String, String>,
+    unqualified_types: HashMap<String, (String, String)>,
 }
 
 impl Env {
     fn new() -> Self {
         let mut env = Self::default();
-        for name in ["Int", "Float", "Bool", "String", "Nil"] {
-            env.types.insert(name.into(), TypeInfo { params: vec![], kind: TypeKind::Bare });
+        for name in ["Int", "Float", "Bool", "String", "UtfCodepoint", "Nil"] {
+            env.types.insert(
+                name.into(),
+                TypeInfo {
+                    params: vec![],
+                    kind: TypeKind::Bare,
+                },
+            );
         }
         env.types.insert("List".into(), TypeInfo { params: vec!["a".into()], kind: TypeKind::Bare });
 
@@ -1150,15 +1190,7 @@ impl<'a> Checker<'a> {
         for definition in &module.definitions {
             match definition {
                 Definition::Type(ty) => checker.register_type(ty)?,
-                Definition::Constant(c) => {
-                    let value = checker.const_value_type(&c.value, c.span)?;
-                    if let Some(annotation) = &c.annotation {
-                        let expected = checker.resolve_annotation(annotation, &HashMap::new(), 0)?;
-                        checker.unify_with(&expected, &value, c.span)?;
-                    }
-                    *checker.env.constants.get_mut(&c.name).expect("registered above") = value;
-                }
-                Definition::Fn(f) => checker.register_function(f)?,
+                Definition::Constant(_) | Definition::Fn(_) => {}
                 Definition::Import(import) => {
                     let path = import.module.join("/");
                     let alias = import
@@ -1166,43 +1198,55 @@ impl<'a> Checker<'a> {
                         .clone()
                         .or_else(|| import.module.last().cloned())
                         .unwrap();
-                    if checker.env.imports.insert(alias.clone(), path.clone()).is_some() {
-                        return Err(checker.error(
-                            format!("duplicate import alias `{alias}`"),
-                            import.span,
-                        ));
+                    if !alias.starts_with('_')
+                        && checker
+                            .env
+                            .imports
+                            .insert(alias.clone(), path.clone())
+                            .is_some()
+                    {
+                        return Err(
+                            checker.error(format!("duplicate import alias `{alias}`"), import.span)
+                        );
                     }
                     for item in &import.unqualified {
-                        match item {
-                            UnqualifiedImport::Value(name) => {
-                                if checker
-                                    .env
-                                    .unqualified_fns
-                                    .insert(name.clone(), path.clone())
-                                    .is_some()
-                                {
-                                    return Err(checker.error(
-                                        format!("duplicate unqualified import `{name}`"),
-                                        import.span,
-                                    ));
-                                }
-                            }
-                            UnqualifiedImport::Type(name) => {
-                                if checker
-                                    .env
-                                    .unqualified_types
-                                    .insert(name.clone(), path.clone())
-                                    .is_some()
-                                {
-                                    return Err(checker.error(
-                                        format!("duplicate unqualified import `type {name}`"),
-                                        import.span,
-                                    ));
-                                }
-                            }
+                        let (name, local, is_type) = item.names();
+                        let table = if is_type {
+                            &mut checker.env.unqualified_types
+                        } else {
+                            &mut checker.env.unqualified_fns
+                        };
+                        if table
+                            .insert(local.into(), (path.clone(), name.into()))
+                            .is_some()
+                        {
+                            return Err(checker.error(
+                                format!("duplicate unqualified import `{local}`"),
+                                import.span,
+                            ));
                         }
                     }
                 }
+            }
+        }
+
+        let constants = dependencies::constants(module).map_err(|constant| {
+            checker.error(
+                format!("cyclic constant `{}`", constant.name),
+                constant.span,
+            )
+        })?;
+        for constant in constants {
+            let value = checker.const_value_type(&constant.value, constant.span)?;
+            if let Some(annotation) = &constant.annotation {
+                let expected = checker.resolve_annotation(annotation, &HashMap::new(), 0)?;
+                checker.unify_with(&expected, &value, constant.span)?;
+            }
+            checker.env.constants.insert(constant.name.clone(), value);
+        }
+        for definition in &module.definitions {
+            if let Definition::Fn(function) = definition {
+                checker.register_function(function)?;
             }
         }
 
@@ -1211,15 +1255,21 @@ impl<'a> Checker<'a> {
 
     /// Pass 2: check every function body against its signature.
     fn check(mut self) -> Result<(), TypeCheckError> {
-        for definition in &self.module.definitions {
-            let Definition::Fn(f) = definition else {
-                continue;
-            };
-            // @external functions have no body to check.
-            if matches!(f.body.expr, Expr::Block(ref body) if body.is_empty()) {
-                continue;
+        for functions in dependencies::functions(self.module) {
+            for function in &functions {
+                if !matches!(function.body.expr, Expr::Block(ref body) if body.is_empty()) {
+                    self.check_function_body(function)?;
+                }
             }
-            self.check_function_body(f)?;
+            for function in functions {
+                let info = self
+                    .env
+                    .functions
+                    .get_mut(&function.name)
+                    .expect("registered function");
+                info.ty = generalize(self.sub.apply(&info.ty), &mut self.sub);
+                info.generalized = true;
+            }
         }
         Ok(())
     }
@@ -1263,7 +1313,7 @@ impl<'a> Checker<'a> {
     }
 
     fn register_function(&mut self, f: &FnDef) -> Result<(), TypeCheckError> {
-        if self.env.functions.contains_key(&f.name) {
+        if self.env.functions.contains_key(&f.name) || self.env.constants.contains_key(&f.name) {
             return Err(self.error(format!("duplicate function `{}`", f.name), f.span));
         }
         let mut param_env = HashMap::new();
@@ -1298,6 +1348,7 @@ impl<'a> Checker<'a> {
         self.env.functions.insert(
             f.name.clone(),
             FnInfo {
+                generalized: false,
                 labels: f
                     .args
                     .iter()
@@ -1326,11 +1377,6 @@ impl<'a> Checker<'a> {
         self.unify_with(&ret, &body_ty, f.body.span)?;
         self.scopes.pop();
 
-        // Generalize the signature so later use sites get fresh instances.
-        let final_signature = self.sub.apply(&t_fn(arg_types, ret));
-        if let Some(info) = self.env.functions.get_mut(&f.name) {
-            info.ty = generalize(final_signature, &mut self.sub);
-        }
         Ok(())
     }
 
@@ -1382,10 +1428,15 @@ impl<'a> Checker<'a> {
         if let Some(ty) = self.env.constants.get(name) {
             return Some(self.sub.apply(ty));
         }
-        if let Some(ty) = self.env.functions.get(name).map(|info| info.ty.clone()) {
-            return Some(self.instantiate(&ty));
+        if let Some(info) = self.env.functions.get(name) {
+            return Some(if info.generalized {
+                let ty = info.ty.clone();
+                self.instantiate(&ty)
+            } else {
+                self.sub.apply(&info.ty)
+            });
         }
-        if let Some(module) = self.env.unqualified_fns.get(name) {
+        if let Some((module, name)) = self.env.unqualified_fns.get(name) {
             if let Some((ty, _)) = std_function(&mut self.sub, module, name) {
                 return Some(ty);
             }
@@ -1416,6 +1467,7 @@ impl<'a> Checker<'a> {
         depth: u32,
     ) -> Result<Type, TypeCheckError> {
         match annotation {
+            TypeAnnotation::Hole => Ok(self.sub.fresh()),
             TypeAnnotation::Named { module, name, args } => {
                 // Lowercase names are type variables of the enclosing signature.
                 if name.starts_with(|c: char| c.is_ascii_lowercase()) && module.is_none() {
@@ -1425,14 +1477,30 @@ impl<'a> Checker<'a> {
                         .ok_or_else(|| self.error(format!("unknown type `{name}`"), Span::point(0)));
                 }
 
-                // Candidate keys, in priority order.
-                let mut candidates: Vec<String> = Vec::new();
+                let mut candidates = Vec::new();
                 if let Some(module) = module {
-                    candidates.push(format!("{module}/{name}"));
-                    candidates.push(name.clone());
-                } else if let Some(path) = self.env.unqualified_types.get(name) {
-                    candidates.push(format!("{path}/{name}"));
-                    candidates.push(name.clone());
+                    let path = self
+                        .env
+                        .imports
+                        .get(module)
+                        .map(String::as_str)
+                        .unwrap_or(module);
+                    if let Some(short) = path.strip_prefix("gleam/") {
+                        candidates.push(format!("{short}/{name}"));
+                        if short == "option" && name == "Option"
+                            || short == "result" && name == "Result"
+                        {
+                            candidates.push(name.clone());
+                        }
+                    } else {
+                        candidates.push(format!("{path}/{name}"));
+                    }
+                } else if let Some((path, imported)) = self.env.unqualified_types.get(name) {
+                    candidates.push(format!(
+                        "{}/{imported}",
+                        path.strip_prefix("gleam/").unwrap_or(path)
+                    ));
+                    candidates.push(imported.clone());
                 } else {
                     candidates.push(name.clone());
                 }
@@ -1477,7 +1545,12 @@ impl<'a> Checker<'a> {
                     TypeKind::Bare => {
                         // Arguments in declaration order (HashMap order is random).
                         let args = info.params.iter().map(|p| param_env[p].clone()).collect();
-                        Ok(Type::app_args(module.clone(), name, args))
+                        let (module, name) = key
+                            .split_once('/')
+                            .map_or((None, key.as_str()), |(module, name)| {
+                                (Some(module.to_owned()), name)
+                            });
+                        Ok(Type::app_args(module, name, args))
                     }
                 }
             }
@@ -1502,20 +1575,21 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The type of a record field, resolved against the constructor's
-    /// parameters (which may be fresh variables).
-    fn field_type(&mut self, ctor: &Ctor, index: usize) -> Result<Type, TypeCheckError> {
-        let mut param_env = HashMap::new();
-        for param in &ctor.params {
-            param_env.insert(param.clone(), self.sub.fresh());
+    fn constructor_signature(&mut self, ctor: &Ctor) -> Result<Callee, TypeCheckError> {
+        let args: Vec<_> = ctor.params.iter().map(|_| self.sub.fresh()).collect();
+        let ret = Type::app_args(ctor.type_module.clone(), &ctor.type_name, args.clone());
+        let variables = ctor.params.iter().cloned().zip(args).collect();
+        let mut params = Vec::with_capacity(ctor.fields.len());
+        let mut labels = Vec::with_capacity(ctor.fields.len());
+        for field in &ctor.fields {
+            params.push(self.resolve_annotation(&field.type_annotation, &variables, 0)?);
+            labels.push(field.label.clone().or_else(|| field.name.clone()));
         }
-        self.resolve_annotation(&ctor.fields[index].type_annotation, &param_env, 0)
-    }
-
-    /// The record type produced by a constructor, with fresh type arguments.
-    fn ctor_record_type(&mut self, ctor: &Ctor) -> Type {
-        let args = (0..ctor.params.len()).map(|_| self.sub.fresh()).collect();
-        Type::app_args(ctor.type_module.clone(), &ctor.type_name, args)
+        Ok(Callee {
+            params,
+            labels,
+            ret,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1535,6 +1609,14 @@ impl<'a> Checker<'a> {
                 .get(name)
                 .map(|ty| self.sub.apply(ty))
                 .ok_or_else(|| self.error(format!("unknown constant `{name}`"), span)),
+            ConstValue::Qualified { module, name } => {
+                Err(self.error(format!("unknown module constant `{module}.{name}`"), span))
+            }
+            ConstValue::Concat(left, right) => {
+                let left = self.const_value_type(left, span)?;
+                let right = self.const_value_type(right, span)?;
+                self.binary_result(BinOp::Concat, &left, &right, span)
+            }
             ConstValue::Constructor(reference, args) => {
                 let ctor = self
                     .env
@@ -1553,25 +1635,26 @@ impl<'a> Checker<'a> {
                         span,
                     ));
                 }
-                let record = self.ctor_record_type(&ctor);
-                for (index, arg) in args.iter().enumerate() {
+                let callee = self.constructor_signature(&ctor)?;
+                let mut typed = Vec::with_capacity(args.len());
+                for arg in args {
                     if let Some(label) = &arg.label {
-                        let expected = ctor.fields[index]
-                            .label
-                            .as_deref()
-                            .or(ctor.fields[index].name.as_deref());
-                        if expected != Some(label.as_str()) {
+                        if !callee
+                            .labels
+                            .iter()
+                            .any(|candidate| candidate.as_ref() == Some(label))
+                        {
                             return Err(self.error(
                                 format!("no field labeled `{label}` in `{}`", reference.name),
                                 span,
                             ));
                         }
                     }
-                    let ty = self.field_type(&ctor, index)?;
-                    let value_ty = self.const_value_type(&arg.value, span)?;
-                    self.unify_with(&ty, &value_ty, span)?;
+                    let ty = self.const_value_type(&arg.value, span)?;
+                    typed.push((arg.label.clone(), Some(ty)));
                 }
-                Ok(record)
+                self.check_arg_types(&callee.params, &callee.labels, &typed, None, span)?;
+                Ok(self.sub.apply(&callee.ret))
             }
             ConstValue::List { elements, spread } => {
                 let elem = self.sub.fresh();
@@ -1599,7 +1682,26 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::Tuple(resolved))
             }
-            ConstValue::BitArray(_) => Ok(Type::BitArray { size: None, unit: None }),
+            ConstValue::BitArray(array) => {
+                for segment in &array.segments {
+                    let value = self.const_value_type(&segment.value, span)?;
+                    let options = self.bit_options(
+                        &segment.options,
+                        matches!(segment.value, ConstValue::String(_)),
+                        span,
+                    )?;
+                    if options
+                        .size
+                        .is_some_and(|size| !matches!(size.expr, Expr::Int(_)))
+                    {
+                        return Err(
+                            self.error("constant bit array sizes must be integer literals", span)
+                        );
+                    }
+                    self.unify_with(&bit_segment_type(options.kind), &value, span)?;
+                }
+                Ok(t_bits())
+            }
         }
     }
 
@@ -1661,29 +1763,17 @@ impl<'a> Checker<'a> {
                 Ok(Type::Tuple(resolved))
             }
 
-            Expr::BitArray(bit_array) => {
-                for segment in &bit_array.segments {
-                    let ty = self.infer(&segment.value)?;
-                    match self.sub.apply(&ty) {
-                        Type::App { name, .. } if matches!(name.as_str(), "Int" | "Float" | "String") => {}
-                        other => {
-                            return Err(self.error(
-                                format!("bit array segments must be Int, Float or String, found {other}"),
-                                span,
-                            ));
-                        }
-                    }
-                    for option in &segment.options {
-                        match option {
-                            BitOption::Size(e) | BitOption::Unit(e) => {
-                                let ty = self.infer(e)?;
-                                self.unify_with(&t_int(), &ty, e.span)?;
-                            }
-                            _ => {}
-                        }
-                    }
+            Expr::BitArray(array) => {
+                for segment in &array.segments {
+                    let value = self.infer(&segment.value)?;
+                    let options = self.bit_options(
+                        &segment.options,
+                        matches!(segment.value.expr, Expr::String(_)),
+                        span,
+                    )?;
+                    self.unify_with(&bit_segment_type(options.kind), &value, span)?;
                 }
-                Ok(Type::BitArray { size: None, unit: None })
+                Ok(t_bits())
             }
 
             Expr::Call(call) => self.check_call(&call.fun, &call.args, span),
@@ -1691,45 +1781,70 @@ impl<'a> Checker<'a> {
             Expr::Fn(literal) => {
                 self.scopes.push(HashMap::new());
                 let mut params = Vec::with_capacity(literal.args.len());
-                for name in &literal.args {
-                    if name.starts_with('_') {
-                        params.push(self.sub.fresh());
-                        continue;
+                let mut names = Vec::new();
+                for annotation in literal
+                    .annotations
+                    .iter()
+                    .flatten()
+                    .chain(&literal.return_annotation)
+                {
+                    collect_annotation_names(annotation, &mut names);
+                }
+                let mut variables = HashMap::new();
+                for name in names {
+                    variables.entry(name).or_insert_with(|| self.sub.fresh());
+                }
+                for (index, name) in literal.args.iter().enumerate() {
+                    let ty = match literal.annotations.get(index).and_then(Option::as_ref) {
+                        Some(annotation) => self.resolve_annotation(annotation, &variables, 0)?,
+                        None => self.sub.fresh(),
+                    };
+                    if !name.starts_with('_') {
+                        self.bind_var(name, ty.clone(), span)?;
                     }
-                    let ty = self.sub.fresh();
-                    self.bind_var(name, ty.clone(), span)?;
                     params.push(ty);
                 }
                 let body = self.infer(&literal.body)?;
+                if let Some(annotation) = &literal.return_annotation {
+                    let expected = self.resolve_annotation(annotation, &variables, 0)?;
+                    self.unify_with(&expected, &body, span)?;
+                }
                 self.scopes.pop();
                 Ok(t_fn(params, body))
             }
 
             Expr::Capture(capture) => {
-                let callee = self.resolve_callee(&capture.fun)?;
-                let mut placeholder: Option<usize> = None;
-                let mut count = 0usize;
-                let mut args: Vec<(Option<String>, Option<&Expression>)> =
-                    Vec::with_capacity(capture.args.len());
-                for (index, arg) in capture.args.iter().enumerate() {
-                    match arg {
-                        CaptureArg::Value(value) => args.push((None, Some(value))),
-                        CaptureArg::Placeholder => {
-                            count += 1;
-                            placeholder = Some(index);
-                            args.push((None, None));
-                        }
-                    }
-                }
-                if count != 1 {
+                let callee =
+                    self.resolve_callee_with_arity(&capture.fun, Some(capture.args.len()))?;
+                let args: Vec<_> = capture
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        CaptureArg::Value(value) => (None, Some(value)),
+                        CaptureArg::Labelled { label, value } => (Some(label.clone()), Some(value)),
+                        CaptureArg::Placeholder => (None, None),
+                        CaptureArg::LabelledPlaceholder(label) => (Some(label.clone()), None),
+                    })
+                    .collect();
+                let mut placeholders = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, value))| value.is_none());
+                let Some((placeholder, _)) = placeholders.next() else {
+                    return Err(self.error("function captures require a `_` placeholder", span));
+                };
+                if placeholders.next().is_some() {
                     return Err(self.error(
                         "function captures require exactly one `_` placeholder",
                         span,
                     ));
                 }
-                let ph = placeholder.expect("placeholder checked above");
-                self.check_args(&callee.params, &callee.labels, &args, None, span)?;
-                Ok(t_fn(vec![callee.params[ph].clone()], callee.ret))
+                let positions =
+                    self.check_args(&callee.params, &callee.labels, &args, None, span)?;
+                Ok(t_fn(
+                    vec![callee.params[positions[placeholder]].clone()],
+                    callee.ret,
+                ))
             }
 
             Expr::RecordUpdate(update) => {
@@ -1738,24 +1853,48 @@ impl<'a> Checker<'a> {
                     .constructors
                     .get(&update.constructor.name)
                     .cloned()
-                    .ok_or_else(|| self.error(format!("unknown constructor `{}`", update.constructor.name), span))?;
-                let record = self.ctor_record_type(&ctor);
+                    .ok_or_else(|| {
+                        self.error(
+                            format!("unknown constructor `{}`", update.constructor.name),
+                            span,
+                        )
+                    })?;
+                let original = self.constructor_signature(&ctor)?;
+                let updated = self.constructor_signature(&ctor)?;
                 let base = self.infer(&update.base)?;
-                self.unify_with(&record, &base, span)?;
+                self.unify_with(&original.ret, &base, span)?;
+                let mut changed = HashSet::new();
                 for arg in &update.args {
                     let CallArg::Labelled { label, value } = arg else {
                         return Err(self.error("record updates require labelled fields", span));
                     };
-                    let index = ctor
-                        .fields
+                    let index = updated
+                        .labels
                         .iter()
-                        .position(|field| field.label.as_deref().or(field.name.as_deref()) == Some(label.as_str()))
-                        .ok_or_else(|| self.error(format!("unknown field `{label}` in `{}`", update.constructor.name), span))?;
+                        .position(|field| field.as_ref() == Some(label))
+                        .ok_or_else(|| {
+                            self.error(
+                                format!("unknown field `{label}` in `{}`", update.constructor.name),
+                                span,
+                            )
+                        })?;
+                    if !changed.insert(index) {
+                        return Err(self.error(
+                            format!("duplicate field `{label}` in record update"),
+                            value.span,
+                        ));
+                    }
                     let ty = self.infer(value)?;
-                    let field = self.field_type(&ctor, index)?;
-                    self.unify_with(&field, &ty, value.span)?;
+                    self.unify_with(&updated.params[index], &ty, value.span)?;
                 }
-                Ok(record)
+                for (index, (before, after)) in
+                    original.params.iter().zip(&updated.params).enumerate()
+                {
+                    if !changed.contains(&index) {
+                        self.unify_with(before, after, span)?;
+                    }
+                }
+                Ok(self.sub.apply(&updated.ret))
             }
 
             Expr::Case(case) => self.infer_case(case, span),
@@ -1780,6 +1919,11 @@ impl<'a> Checker<'a> {
 
             Expr::LetAssert(assert) => {
                 let value = self.infer(&assert.value)?;
+                if let Some(annotation) = &assert.annotation {
+                    let expected = self.resolve_annotation(annotation, &HashMap::new(), 0)?;
+                    self.unify_with(&expected, &value, span)?;
+                }
+                self.check_message(assert.message.as_deref())?;
                 self.check_pattern(&assert.pattern, &value, span)?;
                 Ok(t_nil())
             }
@@ -1787,14 +1931,19 @@ impl<'a> Checker<'a> {
             Expr::Assert(assert) => {
                 let value = self.infer(&assert.value)?;
                 self.unify_with(&t_bool(), &value, span)?;
+                self.check_message(assert.message.as_deref())?;
                 Ok(t_nil())
             }
 
             Expr::Use(use_) => self.infer_use(use_, span),
 
             Expr::Echo(inner) => self.infer(inner),
+            Expr::EchoPipe => Err(self.error("`echo` needs a value", span)),
 
-            Expr::Todo { .. } | Expr::Panic { .. } => Ok(self.sub.fresh()),
+            Expr::Todo { message } | Expr::Panic { message } => {
+                self.check_message(message.as_deref())?;
+                Ok(self.sub.fresh())
+            }
 
             Expr::Binary { op, lhs, rhs } => {
                 let left = self.infer(lhs)?;
@@ -1819,6 +1968,14 @@ impl<'a> Checker<'a> {
 
             Expr::Pipeline { exprs, .. } => self.infer_pipeline(exprs, span),
         }
+    }
+
+    fn check_message(&mut self, message: Option<&Expression>) -> Result<(), TypeCheckError> {
+        if let Some(message) = message {
+            let ty = self.infer(message)?;
+            self.unify_with(&t_string(), &ty, message.span)?;
+        }
+        Ok(())
     }
 
     fn infer_field(&mut self, base: &Expression, label: &str, span: Span) -> Result<Type, TypeCheckError> {
@@ -1851,21 +2008,68 @@ impl<'a> Checker<'a> {
             }
         }
 
-        // Record field: search all constructors (mirrors codegen).
-        for ctor in self.env.constructors.values() {
-            if let Some(index) = ctor
-                .fields
-                .iter()
-                .position(|field| field.label.as_deref().or(field.name.as_deref()) == Some(label))
-            {
-                let ctor = ctor.clone();
-                return self.field_type(&ctor, index);
-            }
+        let base_ty = self.sub.apply(&base_ty);
+        let mut candidates: Vec<_> =
+            self.env
+                .constructors
+                .values()
+                .filter(|ctor| match &base_ty {
+                    Type::App { module, name, .. } => {
+                        ctor.type_name == *name && ctor.type_module == *module
+                    }
+                    Type::Var(_) => ctor.fields.iter().any(|field| {
+                        field.label.as_deref().or(field.name.as_deref()) == Some(label)
+                    }),
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+        if matches!(base_ty, Type::Var(_))
+            && candidates.first().is_some_and(|first| {
+                candidates.iter().any(|ctor| {
+                    ctor.type_name != first.type_name || ctor.type_module != first.type_module
+                })
+            })
+        {
+            return Err(self.error(
+                format!("cannot infer the record type for field `{label}`"),
+                span,
+            ));
         }
-        Err(self.error(format!("unknown record field `{label}`"), span))
+        let field = self.sub.fresh();
+        if candidates.is_empty() {
+            return Err(self.error(
+                format!("unknown record field `{label}` on `{base_ty}`"),
+                span,
+            ));
+        }
+        for ctor in candidates.drain(..) {
+            let signature = self.constructor_signature(&ctor)?;
+            let Some(index) = signature
+                .labels
+                .iter()
+                .position(|field| field.as_deref() == Some(label))
+            else {
+                return Err(self.error(
+                    format!("unknown record field `{label}` on a variant of `{base_ty}`"),
+                    span,
+                ));
+            };
+            self.unify_with(&signature.ret, &base_ty, span)?;
+            self.unify_with(&field, &signature.params[index], span)?;
+        }
+        Ok(self.sub.apply(&field))
     }
 
     fn resolve_callee(&mut self, fun: &Expression) -> Result<Callee, TypeCheckError> {
+        self.resolve_callee_with_arity(fun, None)
+    }
+
+    fn resolve_callee_with_arity(
+        &mut self,
+        fun: &Expression,
+        arity: Option<usize>,
+    ) -> Result<Callee, TypeCheckError> {
         match &fun.expr {
             Expr::Constructor(reference) => {
                 let ctor = self
@@ -1873,20 +2077,13 @@ impl<'a> Checker<'a> {
                     .constructors
                     .get(&reference.name)
                     .cloned()
-                    .ok_or_else(|| self.error(format!("unknown constructor `{}`", reference.name), fun.span))?;
-                let mut params = Vec::with_capacity(ctor.fields.len());
-                for index in 0..ctor.fields.len() {
-                    params.push(self.field_type(&ctor, index)?);
-                }
-                Ok(Callee {
-                    params,
-                    labels: ctor
-                        .fields
-                        .iter()
-                        .map(|field| field.label.clone().or_else(|| field.name.clone()))
-                        .collect(),
-                    ret: self.ctor_record_type(&ctor),
-                })
+                    .ok_or_else(|| {
+                        self.error(
+                            format!("unknown constructor `{}`", reference.name),
+                            fun.span,
+                        )
+                    })?;
+                self.constructor_signature(&ctor)
             }
             Expr::FieldAccess { base, label } => {
                 if let Expr::Var(module) = &base.expr {
@@ -1902,8 +2099,12 @@ impl<'a> Checker<'a> {
                     }
                 }
                 let ty = self.infer(fun)?;
-                match self.sub.apply(&ty) {
-                    Type::Fn(args, ret) => Ok(Callee { params: args, labels: vec![], ret: *ret }),
+                match self.callable_type(&ty, arity, fun.span)? {
+                    Type::Fn(args, ret) => Ok(Callee {
+                        params: args,
+                        labels: vec![],
+                        ret: *ret,
+                    }),
                     other => Err(self.error(format!("`{other}` is not a function"), fun.span)),
                 }
             }
@@ -1912,8 +2113,12 @@ impl<'a> Checker<'a> {
                     .lookup_value(name)
                     .ok_or_else(|| self.error(format!("unknown variable `{name}`"), fun.span))?;
                 let labels = self.callee_labels(name);
-                match self.sub.apply(&ty) {
-                    Type::Fn(args, ret) => Ok(Callee { params: args, labels, ret: *ret }),
+                match self.callable_type(&ty, arity, fun.span)? {
+                    Type::Fn(args, ret) => Ok(Callee {
+                        params: args,
+                        labels,
+                        ret: *ret,
+                    }),
                     other => Err(self.error(
                         format!("`{name}` is not a function (it has type {other})"),
                         fun.span,
@@ -1922,12 +2127,32 @@ impl<'a> Checker<'a> {
             }
             _ => {
                 let ty = self.infer(fun)?;
-                match self.sub.apply(&ty) {
-                    Type::Fn(args, ret) => Ok(Callee { params: args, labels: vec![], ret: *ret }),
+                match self.callable_type(&ty, arity, fun.span)? {
+                    Type::Fn(args, ret) => Ok(Callee {
+                        params: args,
+                        labels: vec![],
+                        ret: *ret,
+                    }),
                     other => Err(self.error(format!("`{other}` is not a function"), fun.span)),
                 }
             }
         }
+    }
+
+    fn callable_type(
+        &mut self,
+        ty: &Type,
+        arity: Option<usize>,
+        span: Span,
+    ) -> Result<Type, TypeCheckError> {
+        let resolved = self.sub.apply(ty);
+        if let (Type::Var(_), Some(arity)) = (&resolved, arity) {
+            let args = (0..arity).map(|_| self.sub.fresh()).collect();
+            let inferred = t_fn(args, self.sub.fresh());
+            self.unify_with(&resolved, &inferred, span)?;
+            return Ok(inferred);
+        }
+        Ok(resolved)
     }
 
     /// Argument labels for a named callee: local functions first, then
@@ -1936,7 +2161,7 @@ impl<'a> Checker<'a> {
         if let Some(f) = self.env.functions.get(name) {
             return f.labels.clone();
         }
-        if let Some(module) = self.env.unqualified_fns.get(name) {
+        if let Some((module, name)) = self.env.unqualified_fns.get(name) {
             if let Some((_, labels)) = std_function(&mut self.sub, module, name) {
                 return labels;
             }
@@ -1944,8 +2169,13 @@ impl<'a> Checker<'a> {
         vec![]
     }
 
-    fn check_call(&mut self, fun: &Expression, args: &[CallArg], span: Span) -> Result<Type, TypeCheckError> {
-        let callee = self.resolve_callee(fun)?;
+    fn check_call(
+        &mut self,
+        fun: &Expression,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<Type, TypeCheckError> {
+        let callee = self.resolve_callee_with_arity(fun, Some(args.len()))?;
         let typed_args: Vec<(Option<String>, Option<&Expression>)> = args
             .iter()
             .map(|arg| match arg {
@@ -1967,7 +2197,7 @@ impl<'a> Checker<'a> {
         args: &[(Option<String>, Option<&Expression>)],
         piped: Option<Type>,
         span: Span,
-    ) -> Result<(), TypeCheckError> {
+    ) -> Result<Vec<usize>, TypeCheckError> {
         let mut typed = Vec::with_capacity(args.len());
         for (label, value) in args {
             match value {
@@ -1985,7 +2215,7 @@ impl<'a> Checker<'a> {
         args: &[(Option<String>, Option<Type>)],
         piped: Option<Type>,
         span: Span,
-    ) -> Result<(), TypeCheckError> {
+    ) -> Result<Vec<usize>, TypeCheckError> {
         let n = params.len();
         let mut filled = vec![false; n];
         let mut position = 0;
@@ -1999,6 +2229,7 @@ impl<'a> Checker<'a> {
             position = 1;
         }
 
+        let mut positions = Vec::with_capacity(args.len());
         for (label, ty) in args {
             let index = match label {
                 None => {
@@ -2028,8 +2259,9 @@ impl<'a> Checker<'a> {
                 ));
             }
             filled[index] = true;
+            positions.push(index);
             if let Some(ty) = ty {
-                self.unify_with(&params[index], &ty, span)?;
+                self.unify_with(&params[index], ty, span)?;
             }
         }
 
@@ -2040,34 +2272,61 @@ impl<'a> Checker<'a> {
                 span,
             ));
         }
-        Ok(())
+        Ok(positions)
     }
 
     fn infer_pipeline(&mut self, exprs: &[Expression], _span: Span) -> Result<Type, TypeCheckError> {
         let mut value = self.infer(&exprs[0])?;
         for stage in &exprs[1..] {
             value = match &stage.expr {
+                Expr::EchoPipe => value,
                 Expr::Call(call) => {
-                    let callee = self.resolve_callee(&call.fun)?;
-                    let typed_args: Vec<(Option<String>, Option<&Expression>)> = call
+                    let callee =
+                        self.resolve_callee_with_arity(&call.fun, Some(call.args.len() + 1))?;
+                    let args: Vec<_> = call
                         .args
                         .iter()
                         .map(|arg| match arg {
                             CallArg::Value(value) => (None, Some(value)),
-                            CallArg::Labelled { label, value } => (Some(label.clone()), Some(value)),
+                            CallArg::Labelled { label, value } => {
+                                (Some(label.clone()), Some(value))
+                            }
                         })
                         .collect();
-                    self.check_args(&callee.params, &callee.labels, &typed_args, Some(value), stage.span)?;
-                    self.sub.apply(&callee.ret)
+                    if callee.params.len() == call.args.len() {
+                        self.check_args(&callee.params, &callee.labels, &args, None, stage.span)?;
+                        let ty = self.callable_type(&callee.ret, Some(1), stage.span)?;
+                        self.apply_pipeline_value(value, ty, stage.span)?
+                    } else {
+                        self.check_args(
+                            &callee.params,
+                            &callee.labels,
+                            &args,
+                            Some(value),
+                            stage.span,
+                        )?;
+                        self.sub.apply(&callee.ret)
+                    }
                 }
                 _ => {
-                    let callee = self.resolve_callee(stage)?;
+                    let callee = self.resolve_callee_with_arity(stage, Some(1))?;
                     self.check_args(&callee.params, &callee.labels, &[], Some(value), stage.span)?;
                     self.sub.apply(&callee.ret)
                 }
             };
         }
         Ok(value)
+    }
+
+    fn apply_pipeline_value(
+        &mut self,
+        value: Type,
+        function: Type,
+        span: Span,
+    ) -> Result<Type, TypeCheckError> {
+        let result = self.sub.fresh();
+        self.unify_with(&t_fn(vec![value], result.clone()), &function, span)?;
+        Ok(self.sub.apply(&result))
     }
 
     fn infer_case(&mut self, case: &Case, span: Span) -> Result<Type, TypeCheckError> {
@@ -2078,12 +2337,33 @@ impl<'a> Checker<'a> {
 
         let mut result: Option<Type> = None;
         for clause in &case.clauses {
-            self.scopes.push(HashMap::new());
-            for (pattern, subject) in clause.patterns.iter().zip(subjects.iter()) {
-                self.check_pattern(pattern, subject, clause.span)?;
+            let mut primary: Option<HashMap<String, Type>> = None;
+            for patterns in clause.pattern_groups() {
+                self.scopes.push(HashMap::new());
+                let mut bound = HashSet::new();
+                for (pattern, subject) in patterns.iter().zip(&subjects) {
+                    self.check_pattern_inner(pattern, subject, clause.span, &mut bound)?;
+                }
+                let bindings = self.scopes.pop().expect("pattern scope is open");
+                if let Some(previous) = &primary {
+                    if previous.len() != bindings.len()
+                        || previous.keys().any(|name| !bindings.contains_key(name))
+                    {
+                        return Err(self.error(
+                            "alternative patterns must bind the same variables",
+                            clause.span,
+                        ));
+                    }
+                    for (name, ty) in previous {
+                        self.unify_with(ty, &bindings[name], clause.span)?;
+                    }
+                } else {
+                    primary = Some(bindings);
+                }
             }
+            self.scopes.push(primary.unwrap_or_default());
             if let Some(guard) = &clause.guard {
-                let ty = self.type_guard(guard)?;
+                let ty = self.infer(&guard.to_expression(clause.span))?;
                 self.unify_with(&t_bool(), &ty, clause.span)?;
             }
             let body = self.infer(&clause.expression)?;
@@ -2101,34 +2381,14 @@ impl<'a> Checker<'a> {
     }
 
     fn infer_use(&mut self, use_: &Use, span: Span) -> Result<Type, TypeCheckError> {
-        // Bind the callback's parameters to fresh variables.
-        self.scopes.push(HashMap::new());
-        let mut params = Vec::with_capacity(use_.patterns.len());
-        for pattern in &use_.patterns {
-            let subject = self.sub.fresh();
-            self.check_pattern(pattern, &subject, span)?;
-            params.push(match pattern {
-                Pattern::Var(name) if !name.starts_with('_') => self
-                    .scopes
-                    .last()
-                    .expect("scope open")
-                    .get(name)
-                    .expect("bound above")
-                    .clone(),
-                _ => subject,
-            });
-        }
-        let callback_ret = self.sub.fresh();
-        let callback = t_fn(params, callback_ret.clone());
-
-        // The call is applied to the callback as its final argument: check
-        // the explicit arguments plus the callback against the callee.
-        let empty: Vec<CallArg> = Vec::new();
-        let (fun, explicit) = match &use_.call.expr {
+        let (fun, explicit): (&Expression, &[CallArg]) = match &use_.call.expr {
             Expr::Call(call) => (&call.fun, &call.args),
-            _ => (&use_.call, &empty),
+            _ => (&use_.call, &[]),
         };
-        let callee = self.resolve_callee(fun)?;
+        let callee = self.resolve_callee_with_arity(fun, Some(explicit.len() + 1))?;
+        let params: Vec<_> = use_.patterns.iter().map(|_| self.sub.fresh()).collect();
+        let callback_ret = self.sub.fresh();
+        let callback = t_fn(params.clone(), callback_ret.clone());
         let mut arg_tys: Vec<(Option<String>, Type)> = Vec::with_capacity(explicit.len() + 1);
         for arg in explicit {
             match arg {
@@ -2143,6 +2403,15 @@ impl<'a> Checker<'a> {
             arg_tys.into_iter().map(|(label, ty)| (label, Some(ty))).collect();
         self.check_arg_types(&callee.params, &callee.labels, &args, None, span)?;
 
+        self.scopes.push(HashMap::new());
+        let mut bound = HashSet::new();
+        for (index, (pattern, ty)) in use_.patterns.iter().zip(&params).enumerate() {
+            if let Some(annotation) = use_.annotations.get(index).and_then(Option::as_ref) {
+                let expected = self.resolve_annotation(annotation, &HashMap::new(), 0)?;
+                self.unify_with(&expected, ty, span)?;
+            }
+            self.check_pattern_inner(pattern, ty, span, &mut bound)?;
+        }
         let body = self.infer(&use_.body)?;
         self.unify_with(&callback_ret, &body, span)?;
         self.scopes.pop();
@@ -2185,8 +2454,13 @@ impl<'a> Checker<'a> {
             Pattern::Bool(_) => self.pattern_literal(&subject, &t_bool(), span),
             Pattern::Nil => self.pattern_literal(&subject, &t_nil(), span),
 
-            Pattern::StringPrefix { rest, .. } => {
+            Pattern::StringPrefix {
+                prefix_alias, rest, ..
+            } => {
                 self.pattern_literal(&subject, &t_string(), span)?;
+                if let Some(name) = prefix_alias {
+                    self.bind_pattern_var(name, t_string(), span, bound)?;
+                }
                 if let Pattern::Var(name) = &**rest {
                     if !name.starts_with('_') {
                         self.bind_pattern_var(name, t_string(), span, bound)?;
@@ -2201,95 +2475,112 @@ impl<'a> Checker<'a> {
                     .constructors
                     .get(&reference.name)
                     .cloned()
-                    .ok_or_else(|| self.error(format!("unknown constructor `{}`", reference.name), span))?;
-                let record = self.ctor_record_type(&ctor);
-                self.unify_with(&record, &subject, span)?;
-
-                // Use the subject's actual type arguments when known.
-                let mut param_env: HashMap<String, Type> = HashMap::new();
-                if let Type::App { name, args: actual, .. } = self.sub.apply(&subject) {
-                    if name == ctor.type_name && actual.len() == ctor.params.len() {
-                        for (param, arg) in ctor.params.iter().zip(actual.iter()) {
-                            param_env.insert(param.clone(), arg.clone());
-                        }
-                    }
-                }
-                for param in &ctor.params {
-                    param_env.entry(param.clone()).or_insert_with(|| self.sub.fresh());
-                }
-
+                    .ok_or_else(|| {
+                        self.error(format!("unknown constructor `{}`", reference.name), span)
+                    })?;
+                let signature = self.constructor_signature(&ctor)?;
+                self.unify_with(&signature.ret, &subject, span)?;
                 let mut position = 0;
+                let mut covered = HashSet::new();
+                let mut has_rest = false;
                 for arg in args {
-                    match arg {
+                    let (index, pattern) = match arg {
                         PatternArg::Named { label, pattern } => {
-                            let index = ctor
-                                .fields
+                            let index = signature
+                                .labels
                                 .iter()
-                                .position(|field| field.label.as_deref().or(field.name.as_deref()) == Some(label.as_str()))
-                                .ok_or_else(|| self.error(format!("unknown field `{label}` in `{}`", reference.name), span))?;
-                            let ty = self.resolve_annotation(&ctor.fields[index].type_annotation, &param_env, 0)?;
-                            self.check_pattern_inner(pattern, &ty, span, bound)?;
+                                .position(|field| field.as_ref() == Some(label))
+                                .ok_or_else(|| {
+                                    self.error(
+                                        format!("unknown field `{label}` in `{}`", reference.name),
+                                        span,
+                                    )
+                                })?;
+                            (index, pattern)
                         }
                         PatternArg::Unnamed(pattern) => {
-                            if position >= ctor.fields.len() {
-                                return Err(self.error(
-                                    format!("pattern for `{}` has too many fields", reference.name),
-                                    span,
-                                ));
-                            }
-                            let ty = self.resolve_annotation(&ctor.fields[position].type_annotation, &param_env, 0)?;
-                            self.check_pattern_inner(pattern, &ty, span, bound)?;
+                            let index = position;
                             position += 1;
+                            (index, pattern)
                         }
-                        PatternArg::DiscardRest => {}
+                        PatternArg::DiscardRest => {
+                            has_rest = true;
+                            continue;
+                        }
+                    };
+                    let ty = signature.params.get(index).ok_or_else(|| {
+                        self.error(
+                            format!("pattern for `{}` has too many fields", reference.name),
+                            span,
+                        )
+                    })?;
+                    if !covered.insert(index) {
+                        return Err(self.error(
+                            format!("pattern for `{}` repeats a field", reference.name),
+                            span,
+                        ));
                     }
+                    self.check_pattern_inner(pattern, ty, span, bound)?;
+                }
+                if !has_rest && covered.len() != signature.params.len() {
+                    return Err(self.error(
+                        format!("pattern for `{}` is missing fields", reference.name),
+                        span,
+                    ));
                 }
                 Ok(())
             }
 
             Pattern::List { elements, rest } => {
-                let elem = match &subject {
-                    Type::App { name, args, .. } if name == "List" && args.len() == 1 => args[0].clone(),
-                    other => {
-                        return Err(self.error(format!("expected a list, found {other}"), span));
-                    }
-                };
+                let elem = self.sub.fresh();
+                let list = t_list(elem.clone());
+                self.unify_with(&list, &subject, span)?;
                 for element in elements {
                     self.check_pattern_inner(element, &elem, span, bound)?;
                 }
                 if let Some(rest) = rest {
-                    self.check_pattern_inner(rest, &t_list(elem), span, bound)?;
+                    self.check_pattern_inner(rest, &list, span, bound)?;
                 }
                 Ok(())
             }
 
-            Pattern::Tuple(elems) => match &subject {
-                Type::Tuple(subject_elems) => {
-                    if subject_elems.len() != elems.len() {
+            Pattern::Tuple(elems) => {
+                let types: Vec<_> = elems.iter().map(|_| self.sub.fresh()).collect();
+                let tuple = Type::Tuple(types);
+                self.unify_with(&tuple, &subject, span)?;
+                let Type::Tuple(types) = tuple else {
+                    unreachable!()
+                };
+                for (pattern, ty) in elems.iter().zip(&types) {
+                    self.check_pattern_inner(pattern, ty, span, bound)?;
+                }
+                Ok(())
+            }
+
+            Pattern::BitArray(array) => {
+                self.unify_with(&t_bits(), &subject, span)?;
+                for (index, segment) in array.segments.iter().enumerate() {
+                    let text = matches!(segment.value, Pattern::String(_));
+                    let options = self.bit_options(&segment.options, text, span)?;
+                    if options.kind.uses_remainder()
+                        && options.size.is_none()
+                        && index + 1 != array.segments.len()
+                    {
                         return Err(self.error(
-                            format!(
-                                "tuple pattern expects {} element(s), but the tuple has {}",
-                                elems.len(),
-                                subject_elems.len()
-                            ),
+                            "only the last bit array pattern segment may match the remainder",
                             span,
                         ));
                     }
-                    for (pattern, ty) in elems.iter().zip(subject_elems.iter()) {
-                        self.check_pattern_inner(pattern, ty, span, bound)?;
+                    if matches!(options.kind, SegmentKind::Text(_)) && !text {
+                        return Err(self
+                            .error("UTF text bit array patterns require a string literal", span));
                     }
-                    Ok(())
-                }
-                other => Err(self.error(format!("expected a tuple, found {other}"), span)),
-            },
-
-            Pattern::BitArray(bit_array) => {
-                if !matches!(subject, Type::BitArray { .. }) {
-                    return Err(self.error(format!("expected a bit array, found {subject}"), span));
-                }
-                for segment in &bit_array.segments {
-                    let ty = self.sub.fresh();
-                    self.check_pattern_inner(&segment.value, &ty, span, bound)?;
+                    self.check_pattern_inner(
+                        &segment.value,
+                        &bit_segment_type(options.kind),
+                        span,
+                        bound,
+                    )?;
                 }
                 Ok(())
             }
@@ -2302,44 +2593,25 @@ impl<'a> Checker<'a> {
                 Ok(())
             }
 
-            Pattern::Alternative(alternatives) => {
-                if alternatives.is_empty() {
-                    return Err(self.error("empty pattern alternative", span));
-                }
-                // The first alternative binds in the current scope; the rest
-                // must bind exactly the same variables with compatible types.
-                let base_len = self.scopes.last().expect("scope open").len();
-                let mut first_bound = HashSet::new();
-                self.check_pattern_inner(&alternatives[0], &subject, span, &mut first_bound)?;
-                let scope = self.scopes.last().expect("scope open");
-                let mut expected: Vec<(String, Type)> =
-                    scope.iter().skip(base_len).map(|(k, v)| (k.clone(), v.clone())).collect();
-                expected.sort_by(|a, b| a.0.cmp(&b.0));
-
-                for alternative in &alternatives[1..] {
-                    self.scopes.push(HashMap::new());
-                    let mut alt_bound = HashSet::new();
-                    self.check_pattern_inner(alternative, &subject, span, &mut alt_bound)?;
-                    let mut actual: Vec<(String, Type)> =
-                        self.scopes.last().expect("scope open").iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                    self.scopes.pop();
-                    actual.sort_by(|a, b| a.0.cmp(&b.0));
-
-                    let expected_names: Vec<&str> = expected.iter().map(|(n, _)| n.as_str()).collect();
-                    let actual_names: Vec<&str> = actual.iter().map(|(n, _)| n.as_str()).collect();
-                    if expected_names != actual_names {
-                        return Err(self.error(
-                            "alternative patterns must bind the same variables",
-                            span,
-                        ));
-                    }
-                    for ((_, e_ty), (_, a_ty)) in expected.iter().zip(actual.iter()) {
-                        self.unify_with(e_ty, a_ty, span)?;
-                    }
-                }
-                Ok(())
+            Pattern::Alternative(_) => {
+                Err(self.error("alternative patterns require a case clause", span))
             }
         }
+    }
+
+    fn bit_options<'b>(
+        &mut self,
+        options: &'b [BitOption],
+        text: bool,
+        span: Span,
+    ) -> Result<SegmentOptions<'b>, TypeCheckError> {
+        let options =
+            SegmentOptions::parse(options, text).map_err(|message| self.error(message, span))?;
+        if let Some(size) = options.size {
+            let ty = self.infer(size)?;
+            self.unify_with(&t_int(), &ty, size.span)?;
+        }
+        Ok(options)
     }
 
     fn bind_pattern_var(
@@ -2368,85 +2640,6 @@ impl<'a> Checker<'a> {
     // ------------------------------------------------------------------
     // Guards
     // ------------------------------------------------------------------
-
-    fn type_guard(&mut self, guard: &Guard) -> Result<Type, TypeCheckError> {
-        match guard {
-            Guard::Int(_) => Ok(t_int()),
-            Guard::Float(_) => Ok(t_float()),
-            Guard::String(_) => Ok(t_string()),
-            Guard::Bool(_) => Ok(t_bool()),
-            Guard::Nil => Ok(t_nil()),
-
-            Guard::Var(name) => self
-                .lookup_value(name)
-                .ok_or_else(|| self.error(format!("unknown variable `{name}` in guard"), Span::point(0))),
-
-            Guard::FieldAccess { base, label } => {
-                let base_ty = self.type_guard(base)?;
-                if let Ok(index) = label.parse::<usize>() {
-                    match self.sub.apply(&base_ty) {
-                        Type::Tuple(elems) if index < elems.len() => return Ok(elems[index].clone()),
-                        other => return Err(self.error(format!("`{other}` is not a tuple with index `{label}`"), Span::point(0))),
-                    }
-                }
-                for ctor in self.env.constructors.values() {
-                    if let Some(index) = ctor
-                        .fields
-                        .iter()
-                        .position(|field| field.label.as_deref().or(field.name.as_deref()) == Some(label))
-                    {
-                        let ctor = ctor.clone();
-                        return self.field_type(&ctor, index);
-                    }
-                }
-                Err(self.error(format!("unknown record field `{label}` in guard"), Span::point(0)))
-            }
-
-            Guard::Call { fun, args } => {
-                let callee = match &**fun {
-                    Guard::Var(name) => {
-                        let ty = self
-                            .lookup_value(name)
-                            .ok_or_else(|| self.error(format!("unknown variable `{name}` in guard"), Span::point(0)))?;
-                        match self.sub.apply(&ty) {
-                            Type::Fn(args, ret) => Callee { params: args, labels: vec![], ret: *ret },
-                            other => return Err(self.error(format!("`{other}` is not a function"), Span::point(0))),
-                        }
-                    }
-                    Guard::FieldAccess { base, label } => {
-                        let Guard::Var(module) = &**base else {
-                            return Err(self.error("guards only support calls to module functions", Span::point(0)));
-                        };
-                        let path = self
-                            .env
-                            .imports
-                            .get(module)
-                            .cloned()
-                            .or_else(|| is_stdlib_module(module).then(|| module.clone()));
-                        let Some(path) = path else {
-                            return Err(self.error(format!("`{module}` is not a module"), Span::point(0)));
-                        };
-                        std_function(&mut self.sub, &path, label)
-                            .map(|(ty, labels)| Callee { params: fn_params(&ty), labels, ret: fn_ret(&ty) })
-                            .ok_or_else(|| self.error(format!("module `{path}` has no function `{label}`"), Span::point(0)))?
-                    }
-                    _ => return Err(self.error("guards only support calls to plain functions", Span::point(0))),
-                };
-                let mut typed = Vec::with_capacity(args.len());
-                for arg in args {
-                    typed.push((None, Some(self.type_guard(arg)?)));
-                }
-                self.check_arg_types(&callee.params, &callee.labels, &typed, None, Span::point(0))?;
-                Ok(self.sub.apply(&callee.ret))
-            }
-
-            Guard::Binary { op, lhs, rhs } => {
-                let left = self.type_guard(lhs)?;
-                let right = self.type_guard(rhs)?;
-                self.binary_result(*op, &left, &right, Span::point(0))
-            }
-        }
-    }
 
     // ------------------------------------------------------------------
     // Operators
@@ -2519,10 +2712,11 @@ fn fn_ret(ty: &Type) -> Type {
 fn collect_annotation_names(annotation: &TypeAnnotation, out: &mut Vec<String>) {
     match annotation {
         TypeAnnotation::Named { module, name, args } => {
-            if module.is_none() && name.starts_with(|c: char| c.is_ascii_lowercase()) {
-                if !out.contains(name) {
-                    out.push(name.clone());
-                }
+            if module.is_none()
+                && name.starts_with(|c: char| c.is_ascii_lowercase())
+                && !out.contains(name)
+            {
+                out.push(name.clone());
             }
             for arg in args {
                 collect_annotation_names(arg, out);
@@ -2539,6 +2733,6 @@ fn collect_annotation_names(annotation: &TypeAnnotation, out: &mut Vec<String>) 
                 collect_annotation_names(elem, out);
             }
         }
-        TypeAnnotation::BitArray { .. } => {}
+        TypeAnnotation::BitArray { .. } | TypeAnnotation::Hole => {}
     }
 }

@@ -65,6 +65,7 @@ pub enum TokenKind {
     External,
     /// `@deprecated`
     Deprecated,
+    Internal,
 
     // -- Operators ----------------------------------------------------------
     Plus,
@@ -154,6 +155,7 @@ impl TokenKind {
             False => "`False`".into(),
             Nil => "`Nil`".into(),
             External => "`@external`".into(),
+            Internal => "`@internal`".into(),
             Deprecated => "`@deprecated`".into(),
             Plus => "`+`".into(),
             Minus => "`-`".into(),
@@ -245,7 +247,10 @@ impl<'a> Lexer<'a> {
                 ));
                 return Ok(tokens);
             }
-            let (kind, end) = self.lex_one()?;
+            let after_dot = tokens
+                .last()
+                .is_some_and(|token| token.kind == TokenKind::Dot);
+            let (kind, end) = self.lex_one(after_dot)?;
             tokens.push(Token::new(
                 kind,
                 Span::new(self.token_start, end),
@@ -350,7 +355,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Lex a single token. Returns the kind and the end byte offset.
-    fn lex_one(&mut self) -> Result<(TokenKind, usize), ParseError> {
+    fn lex_one(&mut self, after_dot: bool) -> Result<(TokenKind, usize), ParseError> {
         self.token_start = self.pos;
         self.token_line = self.line;
         self.token_col = self.col;
@@ -359,7 +364,7 @@ impl<'a> Lexer<'a> {
         let ch = rest.chars().next().unwrap();
 
         match ch {
-            '0'..='9' => self.lex_number(),
+            '0'..='9' => self.lex_number(after_dot),
             '"' => self.lex_string(),
             'a'..='z' | 'A'..='Z' | '_' => self.lex_identifier(),
             '@' => self.lex_attribute(),
@@ -367,7 +372,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn lex_number(&mut self) -> Result<(TokenKind, usize), ParseError> {
+    fn lex_number(&mut self, after_dot: bool) -> Result<(TokenKind, usize), ParseError> {
         let rest = &self.src[self.pos..];
         let start = self.pos;
 
@@ -418,9 +423,8 @@ impl<'a> Lexer<'a> {
             return Err(self.error("invalid number literal"));
         }
 
-        // Float?  `.` followed by a digit.
         let after = &self.src[self.pos..];
-        if after.starts_with('.') && after[1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        if !after_dot && after.starts_with('.') && !after.starts_with("..") {
             self.advance(1); // the dot
             let frac_start = self.pos;
             while let Some(c) = self.src[self.pos..].chars().next() {
@@ -431,7 +435,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             let frac_text = &self.src[frac_start..self.pos];
-            if frac_text.is_empty() || frac_text.ends_with('_') {
+            if frac_text.starts_with('_') || frac_text.ends_with('_') {
                 return Err(self.error("invalid float literal"));
             }
             // Optional exponent: e/E [+-] digits
@@ -452,8 +456,8 @@ impl<'a> Lexer<'a> {
             let full = self.src[start..self.pos].to_string();
             let cleaned: String = full.chars().filter(|c| *c != '_').collect();
             match cleaned.parse::<f64>() {
-                Ok(v) => return Ok((TokenKind::Float(v, full), self.pos)),
-                Err(_) => return Err(self.error("invalid float literal")),
+                Ok(v) if v.is_finite() => return Ok((TokenKind::Float(v, full), self.pos)),
+                _ => return Err(self.error("invalid float literal")),
             }
         }
 
@@ -615,10 +619,9 @@ impl<'a> Lexer<'a> {
         let text = &self.src[start + 1..self.pos];
         match text {
             "external" => Ok((TokenKind::External, self.pos)),
+            "internal" => Ok((TokenKind::Internal, self.pos)),
             "deprecated" => Ok((TokenKind::Deprecated, self.pos)),
-            _ => Err(self.error(format!(
-                "unknown attribute `@{text}` (expected `@external` or `@deprecated`)"
-            ))),
+            _ => Err(self.error(format!("unknown attribute `@{text}`"))),
         }
     }
 

@@ -31,9 +31,12 @@
 //! ```
 
 pub mod ast;
+mod bit_array;
 pub mod codegen;
+mod dependencies;
 pub mod lexer;
 pub mod parser;
+mod project;
 pub mod typechecker;
 
 pub use ast::*;
@@ -43,6 +46,7 @@ pub use codegen::{
 };
 pub use lexer::{lex, Token, TokenKind};
 pub use parser::parse_module;
+pub use project::{translate_file, write_c_project_file, SourceError};
 pub use typechecker::{typecheck, typecheck_source, TypeCheckError};
 
 /// Parse a Gleam source file into an AST.

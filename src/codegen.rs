@@ -5,6 +5,8 @@
 //! dependencies beyond a C11 compiler and the POSIX C library.
 
 use crate::ast::*;
+use crate::bit_array::{SegmentKind, SegmentOptions};
+use crate::dependencies;
 use crate::typechecker::{self, TypeCheckError};
 use std::collections::HashMap;
 use std::fmt;
@@ -115,11 +117,14 @@ pub fn write_c_project(
             return Err(ProjectError::Codegen(error));
         }
     };
-    let directory = directory.as_ref();
-    fs::create_dir_all(directory).map_err(ProjectError::Io)?;
-    fs::write(directory.join("main.c"), c_source).map_err(ProjectError::Io)?;
-    fs::write(directory.join("gleam_runtime.c"), RUNTIME_SOURCE).map_err(ProjectError::Io)?;
-    fs::write(directory.join("gleam_runtime.h"), RUNTIME_HEADER).map_err(ProjectError::Io)?;
+    write_generated_project(&c_source, directory.as_ref()).map_err(ProjectError::Io)
+}
+
+pub(crate) fn write_generated_project(c_source: &str, directory: &Path) -> io::Result<()> {
+    fs::create_dir_all(directory)?;
+    fs::write(directory.join("main.c"), c_source)?;
+    fs::write(directory.join("gleam_runtime.c"), RUNTIME_SOURCE)?;
+    fs::write(directory.join("gleam_runtime.h"), RUNTIME_HEADER)?;
     Ok(())
 }
 
@@ -183,7 +188,7 @@ struct Compiler<'a> {
     constructors: HashMap<String, ConstructorInfo>,
     functions: HashMap<String, FunctionInfo>,
     imports: HashMap<String, String>,
-    unqualified: HashMap<String, String>,
+    unqualified: HashMap<String, (String, String)>,
     constants: Vec<String>,
     visible: HashMap<String, String>,
     scopes: Vec<Scope>,
@@ -261,10 +266,13 @@ impl<'a> Compiler<'a> {
                         .clone()
                         .or_else(|| import.module.last().cloned())
                         .unwrap();
-                    imports.insert(alias, module_name.clone());
+                    if !alias.starts_with('_') {
+                        imports.insert(alias, module_name.clone());
+                    }
                     for item in &import.unqualified {
-                        if let UnqualifiedImport::Value(name) = item {
-                            unqualified.insert(name.clone(), module_name.clone());
+                        let (name, local, is_type) = item.names();
+                        if !is_type {
+                            unqualified.insert(local.into(), (module_name.clone(), name.into()));
                         }
                     }
                 }
@@ -333,7 +341,9 @@ impl<'a> Compiler<'a> {
             ));
         }
         declarations.push('\n');
-        for (tag, info) in &self.constructors {
+        let mut constructors: Vec<_> = self.constructors.iter().collect();
+        constructors.sort_unstable_by_key(|(tag, _)| tag.as_str());
+        for (tag, info) in constructors {
             if info.fields.is_empty() {
                 continue;
             }
@@ -364,17 +374,16 @@ impl<'a> Compiler<'a> {
         }
         if !self.constants.is_empty() {
             constants.push_str("\nstatic void gleam_init_constants(void) {\n");
-            let constants_to_compile: Vec<&ConstantDef> = self
-                .module
-                .definitions
-                .iter()
-                .filter_map(|definition| match definition {
-                    Definition::Constant(constant) => Some(constant),
-                    _ => None,
-                })
-                .collect();
+            let constants_to_compile =
+                dependencies::constants(self.module).map_err(|constant| {
+                    CodegenError::new(
+                        format!("cyclic constant `{}`", constant.name),
+                        constant.span,
+                    )
+                })?;
             for constant in constants_to_compile {
-                let value = self.compile_constant(&constant.value, constant.span)?;
+                let value =
+                    self.compile_constant(&constant.value, constant.span, &mut constants)?;
                 constants.push_str(&format!("  gleam_const_{} = {value};\n", constant.name));
             }
             constants.push_str("}\n\n");
@@ -413,19 +422,28 @@ impl<'a> Compiler<'a> {
         self.scopes.clear();
         self.scopes.push(Scope::default());
 
-        if matches!(function.body.expr, Expr::Block(ref body) if body.is_empty()) {
-            let external = function.attributes.iter().find_map(|attribute| match attribute {
+        if let Some(external) = function
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
                 Attribute::External(external) if external.lang == "c" => Some(external),
                 _ => None,
-            });
-            if let Some(external) = external {
-                return Ok(format!(
-                    "static GValue {}(GClosure *closure, GValue *args, size_t argc) {{\n  (void)closure;\n  return {}(args, argc);\n}}\n\n",
-                    info.c_name, external.function
+            })
+        {
+            if !is_c_identifier(&external.function) {
+                return Err(CodegenError::new(
+                    "invalid C external function name",
+                    function.span,
                 ));
             }
+            return Ok(format!(
+                "extern GValue {symbol}(GValue *, size_t);\nstatic GValue {name}(GClosure *closure, GValue *args, size_t argc) {{\n  (void)closure;\n  if (argc != {arity}) g_panic(\"incorrect argument count\", __FILE__, __LINE__);\n  return {symbol}(args, argc);\n}}\n\n",
+                symbol = external.function, name = info.c_name, arity = info.arity,
+            ));
+        }
+        if matches!(function.body.expr, Expr::Block(ref body) if body.is_empty()) {
             return Err(CodegenError::new(
-                "external functions must use @external(c, \"module\", \"function\")",
+                "function has no implementation for the C target",
                 function.span,
             ));
         }
@@ -497,11 +515,16 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn compile_constant(&mut self, value: &ConstValue, span: Span) -> Result<String, CodegenError> {
+    fn compile_constant(
+        &mut self,
+        value: &ConstValue,
+        span: Span,
+        out: &mut String,
+    ) -> Result<String, CodegenError> {
         match value {
             ConstValue::Int(value) => Ok(format!("g_int({})", self.integer(value, span)?)),
             ConstValue::Float(value) => Ok(format!("g_float({})", self.float(value))),
-            ConstValue::String(value) => Ok(format!("g_string({})", c_string(value))),
+            ConstValue::String(value) => Ok(c_string_value(value)),
             ConstValue::Bool(value) => Ok(format!("g_bool({})", *value as u8)),
             ConstValue::Nil => Ok("g_nil()".into()),
             ConstValue::Var(name) => {
@@ -513,13 +536,13 @@ impl<'a> Compiler<'a> {
             }
             ConstValue::List { elements, spread } => {
                 let mut result = match spread {
-                    Some(rest) => self.compile_constant(rest, span)?,
+                    Some(rest) => self.compile_constant(rest, span, out)?,
                     None => "g_list_empty()".into(),
                 };
                 for element in elements.iter().rev() {
                     result = format!(
                         "g_list_prepend({}, {result})",
-                        self.compile_constant(element, span)?
+                        self.compile_constant(element, span, out)?
                     );
                 }
                 Ok(result)
@@ -530,13 +553,26 @@ impl<'a> Compiler<'a> {
                 }
                 let values = elements
                     .iter()
-                    .map(|element| self.compile_constant(element, span))
+                    .map(|element| self.compile_constant(element, span, out))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(format!(
                     "g_tuple({}, (GValue[]){{{}}})",
                     values.len(),
                     values.join(", ")
                 ))
+            }
+            ConstValue::Qualified { module, name } => Err(CodegenError::new(
+                format!("unknown module constant `{module}.{name}`"),
+                span,
+            )),
+            ConstValue::Concat(left, right) => {
+                let left = self.compile_constant(left, span, out)?;
+                let right = self.compile_constant(right, span, out)?;
+                let temp = self.temp();
+                out.push_str(&format!(
+                    "  GValue {temp}_left = {left};\n  GValue {temp}_right = {right};\n  GValue {temp} = g_string_concat({temp}_left, {temp}_right);\n  g_release({temp}_left);\n  g_release({temp}_right);\n",
+                ));
+                Ok(temp)
             }
             ConstValue::Constructor(reference, args) => {
                 let info = self.constructor(reference, span)?;
@@ -551,21 +587,34 @@ impl<'a> Compiler<'a> {
                         span,
                     ));
                 }
-                let values = args
-                    .iter()
-                    .map(|arg| self.compile_constant(&arg.value, span))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let labels = info.labels();
+                let mut evaluated = Vec::with_capacity(args.len());
+                for arg in args {
+                    evaluated.push((
+                        arg.label.clone(),
+                        self.compile_constant(&arg.value, span, out)?,
+                    ));
+                }
+                let values = order_arguments(evaluated, &labels, span)?;
                 Ok(format!(
-                    "g_record({}, {}, (GValue[]){{{}}})",
+                    "g_record({}, {}, {})",
                     c_string(&reference.name),
                     values.len(),
-                    values.join(", ")
+                    c_arguments(&values),
                 ))
             }
-            ConstValue::BitArray(_) => Err(CodegenError::new(
-                "constant bit arrays are not supported by the C backend",
+            ConstValue::BitArray(array) => self.gen_bits(
+                array,
                 span,
-            )),
+                |value| matches!(value, ConstValue::String(_)),
+                |compiler, value, out| {
+                    let expression = compiler.compile_constant(value, span, out)?;
+                    let temp = compiler.temp();
+                    out.push_str(&format!("  GValue {temp} = {expression};\n"));
+                    Ok(temp)
+                },
+                out,
+            ),
         }
     }
 
@@ -598,7 +647,7 @@ impl<'a> Compiler<'a> {
         match &expression.expr {
             Expr::Int(value) => Ok(format!("g_int({})", self.integer(value, expression.span)?)),
             Expr::Float(value) => Ok(format!("g_float({})", self.float(value))),
-            Expr::String(value) => Ok(format!("g_string({})", c_string(value))),
+            Expr::String(value) => Ok(c_string_value(value)),
             Expr::Bool(value) => Ok(format!("g_bool({})", *value as u8)),
             Expr::Nil => Ok("g_nil()".into()),
             Expr::Var(name) => self.gen_var(name, expression.span),
@@ -613,17 +662,15 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expr::List { elements, spread } => {
-                let rest = match spread {
+                let elements = self.gen_values(elements, out)?;
+                let mut current = match spread {
                     Some(rest) => self.gen_expr(rest, out)?,
                     None => "g_list_empty()".into(),
                 };
-                let mut current = self.temp();
-                out.push_str(&format!("  GValue {current} = {rest};\n"));
                 for element in elements.iter().rev() {
-                    let value = self.gen_expr(element, out)?;
                     let next = self.temp();
                     out.push_str(&format!(
-                        "  GValue {next} = g_list_prepend({value}, {current});\n"
+                        "  GValue {next} = g_list_prepend({element}, {current});\n"
                     ));
                     current = next;
                 }
@@ -633,15 +680,18 @@ impl<'a> Compiler<'a> {
                 let values = self.gen_values(elements, out)?;
                 Ok(self.make_aggregate("g_tuple", &values, out))
             }
-            Expr::BitArray(_) => Err(CodegenError::new(
-                "bit arrays are not yet supported by the C backend",
+            Expr::BitArray(array) => self.gen_bits(
+                array,
                 expression.span,
-            )),
+                |value| matches!(value.expr, Expr::String(_)),
+                Self::gen_expr,
+                out,
+            ),
             Expr::Call(call) => self.gen_call(call, expression.span, out),
             Expr::Fn(function) => self.gen_closure(function, out),
             Expr::Capture(capture) => self.gen_capture(capture, expression.span, out),
             Expr::RecordUpdate(update) => self.gen_record_update(update, expression.span, out),
-            Expr::Case(case) => self.gen_case(case, expression.span, out),
+            Expr::Case(case) => self.gen_case(case, false, out),
             Expr::Block(statements) => self.gen_block(statements, out),
             Expr::Let(let_) => self.gen_let(&let_.pattern, &let_.value, None, expression.span, out),
             Expr::LetAssert(assert) => self.gen_let(
@@ -653,41 +703,43 @@ impl<'a> Compiler<'a> {
             ),
             Expr::Assert(assert) => {
                 let value = self.gen_expr(&assert.value, out)?;
-                out.push_str(&format!(
-                    "  if (({value}).tag != G_BOOL) g_type_error(\"Bool\", {value}, __FILE__, __LINE__);\n  if (!({value}).as.boolean) g_panic({}, __FILE__, __LINE__);\n  g_release({value});\n",
-                    c_string(assert.message.as_deref().unwrap_or("assertion failed"))
-                ));
+                self.require_type("G_BOOL", "Bool", &value, out);
+                out.push_str(&format!("  if (!({value}).as.boolean) {{\n"));
+                self.gen_panic(assert.message.as_deref(), "assertion failed", out)?;
+                out.push_str(&format!("  }}\n  g_release({value});\n"));
                 Ok("g_nil()".into())
             }
-            Expr::Use(_) => Err(CodegenError::new(
-                "`use` expressions are not yet supported by the C backend",
-                expression.span,
-            )),
+            Expr::Use(use_) => self.gen_use(use_, expression.span, out),
+            Expr::EchoPipe => Err(CodegenError::new("`echo` needs a value", expression.span)),
             Expr::Echo(inner) => {
                 let value = self.gen_expr(inner, out)?;
                 out.push_str(&format!("  g_echo({value}, __FILE__, __LINE__);\n"));
                 Ok(value)
             }
-            Expr::Todo { message } => {
-                out.push_str(&format!(
-                    "  g_panic({}, __FILE__, __LINE__);\n",
-                    c_string(message.as_deref().unwrap_or("todo"))
-                ));
-                Ok("g_nil()".into())
-            }
-            Expr::Panic { message } => {
-                out.push_str(&format!(
-                    "  g_panic({}, __FILE__, __LINE__);\n",
-                    c_string(message.as_deref().unwrap_or("panic"))
-                ));
+            Expr::Todo { message } | Expr::Panic { message } => {
+                let fallback = if matches!(expression.expr, Expr::Todo { .. }) {
+                    "todo"
+                } else {
+                    "panic"
+                };
+                self.gen_panic(message.as_deref(), fallback, out)?;
                 Ok("g_nil()".into())
             }
             Expr::Binary { op, lhs, rhs } => self.gen_binary(*op, lhs, rhs, out),
             Expr::Neg(inner) => {
+                if let Expr::Int(number) = &inner.expr {
+                    let signed = IntValue {
+                        raw: format!("-{}", number.raw),
+                    };
+                    return Ok(format!(
+                        "g_int({})",
+                        self.integer(&signed, expression.span)?
+                    ));
+                }
                 let value = self.gen_expr(inner, out)?;
                 let result = self.temp();
                 out.push_str(&format!(
-                    "  GValue {result};\n  if (({value}).tag == G_INT) {{ {result} = g_int(-({value}).as.integer); }}\n  else if (({value}).tag == G_FLOAT) {{ {result} = g_float(-({value}).as.floating); }}\n  else g_type_error(\"Int or Float\", {value}, __FILE__, __LINE__);\n  g_release({value});\n"
+                    "  GValue {result};\n  if (({value}).tag == G_INT) {{ {result} = g_int_from_bits(UINT64_C(0) - (uint64_t)({value}).as.integer); }}\n  else if (({value}).tag == G_FLOAT) {{ {result} = g_float(-({value}).as.floating); }}\n  else g_type_error(\"Int or Float\", {value}, __FILE__, __LINE__);\n  g_release({value});\n"
                 ));
                 Ok(result)
             }
@@ -713,8 +765,8 @@ impl<'a> Compiler<'a> {
         if self.constants.iter().any(|constant| constant == name) {
             return Ok(format!("g_retain(gleam_const_{name})"));
         }
-        if let Some(module) = self.unqualified.get(name).cloned() {
-            if let Some((function, arity, _)) = std_function(&module, name) {
+        if let Some((module, name)) = self.unqualified.get(name).cloned() {
+            if let Some((function, arity, _)) = std_function(&module, &name) {
                 return Ok(self.native_function(function, arity));
             }
         }
@@ -754,9 +806,38 @@ impl<'a> Compiler<'a> {
                 "  GValue {result} = g_retain(g_tuple_get({value}, {index}));\n"
             ));
         } else {
-            let index = self.field_index(label, span)?;
+            let mut candidates: Vec<_> = self
+                .constructors
+                .iter()
+                .filter_map(|(tag, info)| {
+                    let index = info.fields.iter().position(|field| {
+                        field
+                            .label
+                            .as_ref()
+                            .or(field.name.as_ref())
+                            .map(String::as_str)
+                            == Some(label)
+                    })?;
+                    Some((tag, index))
+                })
+                .collect();
+            candidates.sort_unstable();
+            if candidates.is_empty() {
+                return Err(CodegenError::new(
+                    format!("unknown record field `{label}`"),
+                    span,
+                ));
+            }
+            out.push_str(&format!("  GValue {result};\n"));
+            for (tag, index) in candidates {
+                out.push_str(&format!(
+                    "  if (g_record_is({value}, {})) {{ {result} = g_retain(g_record_get({value}, {index})); }} else\n",
+                    c_string(tag),
+                ));
+            }
             out.push_str(&format!(
-                "  GValue {result} = g_retain(g_record_get({value}, {index}));\n"
+                "  g_panic({}, __FILE__, __LINE__);\n",
+                c_string(&format!("record has no field {label}"))
             ));
         }
         out.push_str(&format!("  g_release({value});\n"));
@@ -809,7 +890,7 @@ impl<'a> Compiler<'a> {
                 }
                 self.gen_expr_tail(&statements[last], out)
             }
-            Expr::Case(case) => self.gen_case_tail(case, expression.span, out),
+            Expr::Case(case) => self.gen_case(case, true, out).map(TailOutcome::Value),
             Expr::Call(call) => {
                 if let Some((name, info)) = self.direct_function(&call.fun) {
                     if self.current_fn.as_deref() == Some(name.as_str()) && self.tail_mode {
@@ -849,69 +930,11 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Like `gen_case`, but each clause body is compiled in tail position,
-    /// so clauses ending in a direct self-recursive call become tail jumps.
-    fn gen_case_tail(
+    fn gen_block(
         &mut self,
-        case: &Case,
-        span: Span,
+        statements: &[Expression],
         out: &mut String,
-    ) -> Result<TailOutcome, CodegenError> {
-        let subjects = self.gen_values(&case.subjects, out)?;
-        let result = self.temp();
-        out.push_str(&format!("  GValue {result};\n  int {result}_matched = 0;\n"));
-        self.live_case_subjects.push(subjects.clone());
-        for clause in &case.clauses {
-            let saved_visible = self.visible.clone();
-            out.push_str(&format!("  if (!{result}_matched) {{\n"));
-            self.scopes.push(Scope::default());
-            let mut conditions = Vec::new();
-            for (pattern, subject) in clause.patterns.iter().zip(&subjects) {
-                conditions.push(self.pattern_condition(pattern, subject, span)?);
-            }
-            let condition = if conditions.is_empty() {
-                "1".into()
-            } else {
-                conditions.join(" && ")
-            };
-            out.push_str(&format!("    if ({condition}) {{\n"));
-            for (pattern, subject) in clause.patterns.iter().zip(&subjects) {
-                self.bind_pattern(pattern, subject, out)?;
-            }
-            if let Some(guard) = &clause.guard {
-                let guard = self.gen_guard(guard, out)?;
-                out.push_str(&format!(
-                    "      if (({guard}).tag != G_BOOL) g_type_error(\"Bool\", {guard}, __FILE__, __LINE__);\n      if (({guard}).as.boolean) {{\n      g_release({guard});\n"
-                ));
-            }
-            match self.gen_expr_tail(&clause.expression, out)? {
-                // The clause ends in a tail jump and never falls through.
-                TailOutcome::Jumped => {}
-                TailOutcome::Value(value) => {
-                    // Aliasing the value into the case result transfers
-                    // ownership of its reference (the temporary name is
-                    // never used again).
-                    out.push_str(&format!("      {result} = {value};\n      {result}_matched = 1;\n"));
-                }
-            }
-            if clause.guard.is_some() {
-                out.push_str("      }\n");
-            }
-            self.release_scope(out);
-            out.push_str("    }\n  }\n");
-            self.visible = saved_visible;
-        }
-        self.live_case_subjects.pop();
-        out.push_str(&format!(
-            "  if (!{result}_matched) g_panic(\"no case clause matched\", __FILE__, __LINE__);\n"
-        ));
-        for subject in &subjects {
-            out.push_str(&format!("  g_release({subject});\n"));
-        }
-        Ok(TailOutcome::Value(result))
-    }
-
-    fn gen_block(&mut self, statements: &[Expression], out: &mut String) -> Result<String, CodegenError> {
+    ) -> Result<String, CodegenError> {
         let saved_visible = self.visible.clone();
         self.scopes.push(Scope::default());
         let mut result = "g_nil()".to_string();
@@ -928,21 +951,46 @@ impl<'a> Compiler<'a> {
         Ok(result)
     }
 
+    fn gen_panic(
+        &mut self,
+        message: Option<&Expression>,
+        fallback: &str,
+        out: &mut String,
+    ) -> Result<(), CodegenError> {
+        if let Some(message) = message {
+            let value = self.gen_expr(message, out)?;
+            out.push_str(&format!("  g_panic_value({value}, __FILE__, __LINE__);\n"));
+        } else {
+            out.push_str(&format!(
+                "  g_panic({}, __FILE__, __LINE__);\n",
+                c_string(fallback)
+            ));
+        }
+        Ok(())
+    }
+
     fn gen_let(
         &mut self,
         pattern: &Pattern,
         value: &Expression,
-        message: Option<&str>,
+        message: Option<&Expression>,
         span: Span,
         out: &mut String,
     ) -> Result<String, CodegenError> {
         let value = self.gen_expr(value, out)?;
-        let condition = self.pattern_condition(pattern, &value, span)?;
-        out.push_str(&format!(
-            "  if (!({condition})) g_panic({}, __FILE__, __LINE__);\n",
-            c_string(message.unwrap_or("pattern match failed"))
-        ));
-        self.bind_pattern(pattern, &value, out)?;
+        let matched = self.temp();
+        out.push_str(&format!("  int {matched} = 1;\n"));
+        let previous = message.map(|_| self.visible.clone());
+        self.gen_pattern(pattern, &value, &matched, span, out)?;
+        out.push_str(&format!("  if (!{matched}) {{\n"));
+        if let Some(previous) = previous {
+            let bindings = std::mem::replace(&mut self.visible, previous);
+            self.gen_panic(message, "pattern match failed", out)?;
+            self.visible = bindings;
+        } else {
+            self.gen_panic(None, "pattern match failed", out)?;
+        }
+        out.push_str("  }\n");
         out.push_str(&format!("  g_release({value});\n"));
         Ok("g_nil()".into())
     }
@@ -1011,7 +1059,7 @@ impl<'a> Compiler<'a> {
                     BinOp::Minus => "-",
                     _ => "*",
                 };
-                format!("GValue {result} = g_int(({left}).as.integer {operator} ({right}).as.integer);")
+                format!("GValue {result} = g_int_from_bits((uint64_t)({left}).as.integer {operator} (uint64_t)({right}).as.integer);")
             }
             BinOp::PlusFloat | BinOp::MinusFloat | BinOp::TimesFloat | BinOp::SlashFloat => {
                 self.require_type("G_FLOAT", "Float", &left, out);
@@ -1022,7 +1070,11 @@ impl<'a> Compiler<'a> {
                     BinOp::TimesFloat => "*",
                     _ => "/",
                 };
-                format!("GValue {result} = g_float(({left}).as.floating {operator} ({right}).as.floating);")
+                if op == BinOp::SlashFloat {
+                    format!("GValue {result} = g_float(({right}).as.floating == 0.0 ? 0.0 : ({left}).as.floating / ({right}).as.floating);")
+                } else {
+                    format!("GValue {result} = g_float(({left}).as.floating {operator} ({right}).as.floating);")
+                }
             }
             BinOp::And | BinOp::Or => unreachable!(),
         };
@@ -1096,7 +1148,7 @@ impl<'a> Compiler<'a> {
                 if let Some(info) = self.functions.get(name) {
                     return Some((info.c_name.clone(), info.clone()));
                 }
-                let module = self.unqualified.get(name)?;
+                let (module, name) = self.unqualified.get(name)?;
                 let (function, arity, labels) = std_function(module, name)?;
                 Some((
                     function.into(),
@@ -1155,25 +1207,7 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
-        let mut ordered = vec![None; evaluated.len()];
-        let mut position = 0;
-        for (label, value) in evaluated {
-            let index = if let Some(label) = label {
-                labels.iter().position(|candidate| candidate.as_ref() == Some(&label))
-            } else {
-                while position < ordered.len() && ordered[position].is_some() {
-                    position += 1;
-                }
-                (position < ordered.len()).then_some(position)
-            };
-            let Some(index) = index.filter(|index| *index < ordered.len()) else {
-                return Err(CodegenError::new("unknown or misplaced call argument", Span::point(0)));
-            };
-            if ordered[index].replace(value).is_some() {
-                return Err(CodegenError::new("duplicate call argument", Span::point(0)));
-            }
-        }
-        Ok(ordered.into_iter().map(Option::unwrap).collect())
+        order_arguments(evaluated, labels, Span::point(0))
     }
 
     fn make_record(&mut self, tag: &str, values: &[String], out: &mut String) -> String {
@@ -1190,309 +1224,394 @@ impl<'a> Compiler<'a> {
     fn gen_pipeline(&mut self, exprs: &[Expression], out: &mut String) -> Result<String, CodegenError> {
         let mut value = self.gen_expr(&exprs[0], out)?;
         for stage in &exprs[1..] {
-            match &stage.expr {
-                Expr::Var(_) | Expr::FieldAccess { .. } | Expr::Constructor(_) => {
-                    let function = self.gen_expr(stage, out)?;
-                    let result = self.temp();
-                    out.push_str(&format!(
-                        "  GValue {result} = g_call({function}, (GValue[]){{{value}}}, 1);\n  g_release({function});\n  g_release({value});\n"
-                    ));
-                    value = result;
+            let next = match &stage.expr {
+                Expr::EchoPipe => {
+                    out.push_str(&format!("  g_echo({value}, __FILE__, __LINE__);\n"));
+                    continue;
                 }
-                Expr::Call(call) => {
-                    // Resolve labels like a direct call so labeled arguments
-                    // work in pipeline stages; the piped value occupies the
-                    // first slot, so skip it when matching labels.
-                    let labels = self
-                        .direct_function(&call.fun)
-                        .map(|(_, info)| info.labels)
-                        .unwrap_or_else(|| vec![None; call.args.len()]);
-                    let values = self.eval_call_args(&call.args, &labels[1.min(labels.len())..], out)?;
-                    let function = self.gen_expr(&call.fun, out)?;
-                    let mut all = vec![value.clone()];
-                    all.extend(values.iter().cloned());
-                    let result = self.temp();
-                    out.push_str(&format!(
-                        "  GValue {result} = g_call({function}, {}, {});\n  g_release({function});\n  g_release({value});\n",
-                        c_arguments(&all), all.len()
-                    ));
-                    for argument in values {
-                        out.push_str(&format!("  g_release({argument});\n"));
-                    }
-                    value = result;
-                }
+                Expr::Call(call) => self.gen_pipeline_call(call, &value, stage.span, out)?,
                 _ => {
                     let function = self.gen_expr(stage, out)?;
                     let result = self.temp();
                     out.push_str(&format!(
-                        "  GValue {result} = g_call({function}, (GValue[]){{{value}}}, 1);\n  g_release({function});\n  g_release({value});\n"
+                        "  GValue {result} = g_call({function}, (GValue[]){{{value}}}, 1);\n  g_release({function});\n"
                     ));
-                    value = result;
+                    result
                 }
-            }
+            };
+            out.push_str(&format!("  g_release({value});\n"));
+            value = next;
         }
         Ok(value)
     }
 
-    fn gen_case(&mut self, case: &Case, span: Span, out: &mut String) -> Result<String, CodegenError> {
+    fn gen_pipeline_call(
+        &mut self,
+        call: &Call,
+        value: &str,
+        span: Span,
+        out: &mut String,
+    ) -> Result<String, CodegenError> {
+        let arity = match &call.fun.expr {
+            Expr::Constructor(reference) => Some(self.constructor(reference, span)?.fields.len()),
+            _ => self.direct_function(&call.fun).map(|(_, info)| info.arity),
+        };
+        let result = self.temp();
+        match arity {
+            Some(arity) if arity == call.args.len() => {
+                let function = self.gen_call(call, span, out)?;
+                out.push_str(&format!(
+                    "  GValue {result} = g_call({function}, (GValue[]){{{value}}}, 1);\n  g_release({function});\n"
+                ));
+                Ok(result)
+            }
+            Some(_) => {
+                let name = format!("${result}");
+                self.visible.insert(name.clone(), value.into());
+                let mut call = call.clone();
+                call.args.insert(
+                    0,
+                    CallArg::Value(Expression::synthetic(Expr::Var(name.clone()))),
+                );
+                let generated = self.gen_call(&call, span, out);
+                self.visible.remove(&name);
+                generated
+            }
+            None => {
+                let function = self.gen_expr(&call.fun, out)?;
+                let args = self.eval_call_args(&call.args, &vec![None; call.args.len()], out)?;
+                let mut with_piped = vec![value.to_owned()];
+                with_piped.extend(args.iter().cloned());
+                let argc = args.len();
+                out.push_str(&format!(
+                    "  GValue {result};\n  if (g_arity({function}) == {argc}) {{\n    GValue next = g_call({function}, {}, {argc});\n    {result} = g_call(next, (GValue[]){{{value}}}, 1);\n    g_release(next);\n  }} else {{\n    {result} = g_call({function}, {}, {});\n  }}\n  g_release({function});\n",
+                    c_arguments(&args), c_arguments(&with_piped), with_piped.len(),
+                ));
+                for arg in &args {
+                    out.push_str(&format!("  g_release({arg});\n"));
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    fn gen_case(
+        &mut self,
+        case: &Case,
+        tail: bool,
+        out: &mut String,
+    ) -> Result<String, CodegenError> {
         let subjects = self.gen_values(&case.subjects, out)?;
         let result = self.temp();
-        out.push_str(&format!("  GValue {result};\n  int {result}_matched = 0;\n"));
+        out.push_str(&format!(
+            "  GValue {result};\n  int {result}_matched = 0;\n"
+        ));
+        if tail {
+            self.live_case_subjects.push(subjects.clone());
+        }
         for clause in &case.clauses {
-            let saved_visible = self.visible.clone();
-            out.push_str(&format!("  if (!{result}_matched) {{\n"));
-            self.scopes.push(Scope::default());
-            let mut conditions = Vec::new();
-            for (pattern, subject) in clause.patterns.iter().zip(&subjects) {
-                conditions.push(self.pattern_condition(pattern, subject, span)?);
-            }
-            let condition = if conditions.is_empty() {
-                "1".into()
-            } else {
-                conditions.join(" && ")
-            };
-            out.push_str(&format!("    if ({condition}) {{\n"));
-            for (pattern, subject) in clause.patterns.iter().zip(&subjects) {
-                self.bind_pattern(pattern, subject, out)?;
-            }
-            if let Some(guard) = &clause.guard {
-                let guard = self.gen_guard(guard, out)?;
+            for patterns in clause.pattern_groups() {
+                let saved_visible = self.visible.clone();
+                let matched = self.temp();
                 out.push_str(&format!(
-                    "      if (({guard}).tag != G_BOOL) g_type_error(\"Bool\", {guard}, __FILE__, __LINE__);\n      if (({guard}).as.boolean) {{\n      g_release({guard});\n"
+                    "  if (!{result}_matched) {{\n  int {matched} = 1;\n"
                 ));
+                self.scopes.push(Scope::default());
+                for (pattern, subject) in patterns.iter().zip(&subjects) {
+                    self.gen_pattern(pattern, subject, &matched, clause.span, out)?;
+                }
+                if let Some(guard) = &clause.guard {
+                    out.push_str(&format!("  if ({matched}) {{\n"));
+                    let guard = self.gen_expr(&guard.to_expression(clause.span), out)?;
+                    out.push_str(&format!(
+                        "  {matched} = ({guard}).as.boolean;\n  g_release({guard});\n  }}\n",
+                    ));
+                }
+                out.push_str(&format!("  if ({matched}) {{\n"));
+                self.scopes.push(Scope::default());
+                let outcome = if tail {
+                    self.gen_expr_tail(&clause.expression, out)?
+                } else {
+                    TailOutcome::Value(self.gen_expr(&clause.expression, out)?)
+                };
+                if let TailOutcome::Value(value) = outcome {
+                    out.push_str(&format!("  {result} = {value};\n  {result}_matched = 1;\n"));
+                }
+                self.release_scope(out);
+                out.push_str("  }\n");
+                self.release_scope(out);
+                out.push_str("  }\n");
+                self.visible = saved_visible;
             }
-            let value = self.gen_expr(&clause.expression, out)?;
-            // Aliasing the value into the case result transfers ownership
-            // of its reference (the temporary name is never used again).
-            out.push_str(&format!("      {result} = {value};\n      {result}_matched = 1;\n"));
-            if clause.guard.is_some() {
-                out.push_str("      }\n");
-            }
-            self.release_scope(out);
-            out.push_str("    }\n  }\n");
-            self.visible = saved_visible;
+        }
+        if tail {
+            self.live_case_subjects.pop();
         }
         out.push_str(&format!(
             "  if (!{result}_matched) g_panic(\"no case clause matched\", __FILE__, __LINE__);\n"
         ));
-        for subject in subjects {
+        for subject in &subjects {
             out.push_str(&format!("  g_release({subject});\n"));
         }
         Ok(result)
     }
 
-    /// Evaluate a guard and materialize its result in a named temporary,
-    /// mirroring `gen_expr` so the value is only created once.
-    fn gen_guard(&mut self, guard: &Guard, out: &mut String) -> Result<String, CodegenError> {
-        let inner = self.gen_guard_inner(guard, out)?;
-        let temp = self.temp();
-        out.push_str(&format!("  GValue {temp} = {inner};\n"));
-        Ok(temp)
+    fn gen_bits<T>(
+        &mut self,
+        array: &BitArray<T>,
+        span: Span,
+        value_expression: impl Fn(&T) -> bool,
+        mut compile_value: impl FnMut(&mut Self, &T, &mut String) -> Result<String, CodegenError>,
+        out: &mut String,
+    ) -> Result<String, CodegenError> {
+        let builder = self.temp();
+        out.push_str(&format!("  GBitBuilder {builder} = {{0}};\n"));
+        for segment in &array.segments {
+            let options = SegmentOptions::parse(&segment.options, value_expression(&segment.value))
+                .map_err(|message| CodegenError::new(message, span))?;
+            let value = compile_value(self, &segment.value, out)?;
+            self.append_bit_segment(&builder, &value, &options, out)?;
+            out.push_str(&format!("  g_release({value});\n"));
+        }
+        Ok(format!("g_bits_finish(&{builder})"))
     }
 
-    fn gen_guard_inner(&mut self, guard: &Guard, out: &mut String) -> Result<String, CodegenError> {
-        match guard {
-            Guard::Int(value) => Ok(format!("g_int({})", self.integer(value, Span::point(0))?)),
-            Guard::Float(value) => Ok(format!("g_float({})", self.float(value))),
-            Guard::String(value) => Ok(format!("g_string({})", c_string(value))),
-            Guard::Bool(value) => Ok(format!("g_bool({})", *value as u8)),
-            Guard::Nil => Ok("g_nil()".into()),
-            Guard::Var(name) => self.gen_var(name, Span::point(0)),
-            Guard::FieldAccess { base, label } => {
-                let value = self.gen_guard(base, out)?;
-                let result = self.temp();
-                if let Ok(index) = label.parse::<usize>() {
-                    out.push_str(&format!(
-                        "  GValue {result} = g_retain(g_tuple_get({value}, {index}));\n"
-                    ));
-                } else {
-                    let index = self.field_index(label, Span::point(0))?;
-                    out.push_str(&format!(
-                        "  GValue {result} = g_retain(g_record_get({value}, {index}));\n"
-                    ));
-                }
-                out.push_str(&format!("  g_release({value});\n"));
-                Ok(result)
-            }
-            Guard::Call { .. } => Err(CodegenError::new(
-                "function calls in guards are not supported by the C backend",
-                Span::point(0),
-            )),
-            Guard::Binary { op, lhs, rhs } => {
-                let left = self.gen_guard(lhs, out)?;
-                let right = self.gen_guard(rhs, out)?;
-                let result = self.temp();
-                let expression = match op {
-                    BinOp::And | BinOp::Or => {
-                        let operator = if *op == BinOp::And { "&&" } else { "||" };
-                        format!("g_bool(({left}).as.boolean {operator} ({right}).as.boolean)")
-                    }
-                    BinOp::Eq | BinOp::NotEq => format!(
-                        "g_bool({}g_equal({left}, {right}))",
-                        if *op == BinOp::NotEq { "!" } else { "" }
-                    ),
-                    BinOp::Concat => format!("g_string_concat({left}, {right})"),
-                    _ => {
-                        let operator = match op {
-                            BinOp::Lt | BinOp::LtFloat => "<",
-                            BinOp::Gt | BinOp::GtFloat => ">",
-                            BinOp::LtEq | BinOp::LtEqFloat => "<=",
-                            BinOp::GtEq | BinOp::GtEqFloat => ">=",
-                            BinOp::Plus | BinOp::PlusFloat => "+",
-                            BinOp::Minus | BinOp::MinusFloat => "-",
-                            BinOp::Times | BinOp::TimesFloat => "*",
-                            BinOp::Slash | BinOp::SlashFloat => "/",
-                            BinOp::Percent => "%",
-                            _ => return Err(CodegenError::new("invalid guard operator", Span::point(0))),
-                        };
-                        if matches!(op, BinOp::PlusFloat | BinOp::MinusFloat | BinOp::TimesFloat | BinOp::SlashFloat | BinOp::LtFloat | BinOp::GtFloat | BinOp::LtEqFloat | BinOp::GtEqFloat) {
-                            if matches!(op, BinOp::LtFloat | BinOp::GtFloat | BinOp::LtEqFloat | BinOp::GtEqFloat) {
-                                format!("g_bool(({left}).as.floating {operator} ({right}).as.floating)")
-                            } else {
-                                format!("g_float(({left}).as.floating {operator} ({right}).as.floating)")
-                            }
-                        } else if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq) {
-                            format!("g_bool(({left}).as.integer {operator} ({right}).as.integer)")
-                        } else {
-                            format!("g_int(({left}).as.integer {operator} ({right}).as.integer)")
-                        }
-                    }
-                };
-                out.push_str(&format!(
-                    "  GValue {result} = {expression};\n  g_release({left});\n  g_release({right});\n"
-                ));
-                Ok(result)
-            }
+    fn append_bit_segment(
+        &mut self,
+        builder: &str,
+        value: &str,
+        options: &SegmentOptions<'_>,
+        out: &mut String,
+    ) -> Result<(), CodegenError> {
+        let size = self.bit_size(options, out)?;
+        out.push_str(&format!(
+            "  g_bits_append(&{builder}, {value}, {}, {}, {size}, {});\n",
+            options.kind.c_name(),
+            options.endian,
+            options.unit,
+        ));
+        Ok(())
+    }
+
+    fn bit_size(
+        &mut self,
+        options: &SegmentOptions<'_>,
+        out: &mut String,
+    ) -> Result<String, CodegenError> {
+        match options.size {
+            Some(size) => self.gen_expr(size, out),
+            None => Ok("g_nil()".into()),
         }
     }
 
-    fn pattern_condition(&self, pattern: &Pattern, value: &str, span: Span) -> Result<String, CodegenError> {
-        Ok(match pattern {
-            Pattern::Var(_) | Pattern::Discard(_) => "1".into(),
-            Pattern::Int(expected) => format!(
-                "({value}).tag == G_INT && ({value}).as.integer == {}",
-                expected.as_u64().ok_or_else(|| CodegenError::new("invalid integer", span))?
-            ),
-            Pattern::Float(expected) => format!(
-                "({value}).tag == G_FLOAT && ({value}).as.floating == {}",
-                self.float(expected)
-            ),
-            Pattern::String(expected) => {
-                format!("g_string_equals({value}, {})", c_string(expected))
-            },
-            Pattern::Bool(expected) => format!(
-                "({value}).tag == G_BOOL && ({value}).as.boolean == {}",
-                *expected as u8
-            ),
-            Pattern::Nil => format!("({value}).tag == G_NIL"),
-            Pattern::StringPrefix { prefix, .. } => {
-                format!("g_string_starts_with({value}, {})", c_string(prefix))
+    fn gen_bit_pattern(
+        &mut self,
+        array: &BitArray<Pattern>,
+        value: &str,
+        matched: &str,
+        span: Span,
+        out: &mut String,
+    ) -> Result<(), CodegenError> {
+        let offset = self.temp();
+        out.push_str(&format!("  size_t {offset} = 0;\n"));
+        for segment in &array.segments {
+            let text = matches!(segment.value, Pattern::String(_));
+            let options = SegmentOptions::parse(&segment.options, text)
+                .map_err(|message| CodegenError::new(message, span))?;
+            if let (SegmentKind::Text(_), Pattern::String(text)) = (options.kind, &segment.value) {
+                out.push_str(&format!("  if ({matched}) {{\n"));
+                let builder = self.temp();
+                let string = self.temp();
+                let prefix = self.temp();
+                out.push_str(&format!(
+                    "  GBitBuilder {builder} = {{0}};\n  GValue {string} = {};\n",
+                    c_string_value(text),
+                ));
+                self.append_bit_segment(&builder, &string, &options, out)?;
+                out.push_str(&format!(
+                    "  GValue {prefix} = g_bits_finish(&{builder});\n  {matched} = g_bits_prefix({value}, &{offset}, {prefix});\n  g_release({prefix});\n  g_release({string});\n  }}\n",
+                ));
+                continue;
             }
-            Pattern::Constructor(reference, args) => {
-                let info = self.constructor(reference, span)?;
-                let mut checks = vec![format!("g_record_is({value}, {})", c_string(&reference.name))];
-                let mut position = 0;
-                for arg in args {
-                    match arg {
-                        PatternArg::Named { label, pattern } => {
-                            let index = info.fields.iter().position(|field| {
-                                field.label.as_ref().or(field.name.as_ref()).map(String::as_str) == Some(label)
-                            }).ok_or_else(|| CodegenError::new(format!("unknown field `{label}`"), span))?;
-                            checks.push(self.pattern_condition(pattern, &format!("g_record_get({value}, {index})"), span)?);
-                        }
-                        PatternArg::Unnamed(pattern) => {
-                            checks.push(self.pattern_condition(pattern, &format!("g_record_get({value}, {position})"), span)?);
-                            position += 1;
-                        }
-                        PatternArg::DiscardRest => {}
-                    }
-                }
-                checks.join(" && ")
-            }
-            Pattern::List { elements, rest } => {
-                let minimum = elements.len();
-                let length_check = if rest.is_some() { ">=" } else { "==" };
-                let mut checks = vec![format!(
-                    "(({value}).tag == G_NIL || ({value}).tag == G_LIST) && g_list_length({value}) {length_check} {minimum}"
-                )];
-                for (index, element) in elements.iter().enumerate() {
-                    checks.push(self.pattern_condition(element, &list_item(value, index), span)?);
-                }
-                checks.join(" && ")
-            }
-            Pattern::Tuple(elements) => {
-                let mut checks = vec![format!("({value}).tag == G_TUPLE && ((GTuple *)({value}).as.pointer)->length == {}", elements.len())];
-                for (index, element) in elements.iter().enumerate() {
-                    checks.push(self.pattern_condition(element, &format!("g_tuple_get({value}, {index})"), span)?);
-                }
-                checks.join(" && ")
-            }
-            Pattern::BitArray(_) => return Err(CodegenError::new("bit array patterns are not supported", span)),
-            Pattern::Alias { pattern, .. } => self.pattern_condition(pattern, value, span)?,
-            Pattern::Alternative(patterns) => {
-                let checks = patterns
-                    .iter()
-                    .map(|pattern| self.pattern_condition(pattern, value, span))
-                    .collect::<Result<Vec<_>, _>>()?;
-                format!("({})", checks.join(" || "))
-            }
-        })
+            let part = self.temp();
+            out.push_str(&format!(
+                "  GValue {part} = g_nil();\n  if ({matched}) {{\n"
+            ));
+            let size = self.bit_size(&options, out)?;
+            out.push_str(&format!(
+                "  {matched} = g_bits_take({value}, &{offset}, {}, {}, {size}, {}, {}, &{part});\n  }}\n",
+                options.kind.c_name(), options.endian, options.unit, u8::from(options.signed),
+            ));
+            self.gen_pattern(&segment.value, &part, matched, span, out)?;
+            out.push_str(&format!("  g_release({part});\n"));
+        }
+        pattern_test(matched, &format!("g_bits_end({value}, {offset})"), out);
+        Ok(())
     }
 
-    fn bind_pattern(&mut self, pattern: &Pattern, value: &str, out: &mut String) -> Result<(), CodegenError> {
+    fn gen_pattern(
+        &mut self,
+        pattern: &Pattern,
+        value: &str,
+        matched: &str,
+        span: Span,
+        out: &mut String,
+    ) -> Result<(), CodegenError> {
         match pattern {
-            Pattern::Var(name) => self.bind(name, format!("g_retain({value})"), out),
+            Pattern::Var(name) => {
+                self.bind(
+                    name,
+                    format!("{matched} ? g_retain({value}) : g_nil()"),
+                    out,
+                );
+            }
             Pattern::Discard(_) => {}
-            Pattern::StringPrefix { prefix, rest } => {
-                self.bind_pattern(rest, &format!("g_string_drop_prefix({value}, {})", prefix.len()), out)?;
+            Pattern::Int(expected) => pattern_test(
+                matched,
+                &format!(
+                    "({value}).tag == G_INT && ({value}).as.integer == {}",
+                    self.integer(expected, span)?
+                ),
+                out,
+            ),
+            Pattern::Float(expected) => pattern_test(
+                matched,
+                &format!(
+                    "({value}).tag == G_FLOAT && ({value}).as.floating == {}",
+                    self.float(expected)
+                ),
+                out,
+            ),
+            Pattern::String(expected) => pattern_test(
+                matched,
+                &format!(
+                    "g_string_equals_n({value}, {}, {})",
+                    c_string(expected),
+                    expected.len()
+                ),
+                out,
+            ),
+            Pattern::Bool(expected) => pattern_test(
+                matched,
+                &format!(
+                    "({value}).tag == G_BOOL && ({value}).as.boolean == {}",
+                    u8::from(*expected)
+                ),
+                out,
+            ),
+            Pattern::Nil => pattern_test(matched, &format!("({value}).tag == G_NIL"), out),
+            Pattern::StringPrefix {
+                prefix,
+                prefix_alias,
+                rest,
+            } => {
+                pattern_test(
+                    matched,
+                    &format!(
+                        "g_string_starts_with_n({value}, {}, {})",
+                        c_string(prefix),
+                        prefix.len()
+                    ),
+                    out,
+                );
+                if let Some(name) = prefix_alias {
+                    self.bind(
+                        name,
+                        format!("{matched} ? {} : g_nil()", c_string_value(prefix)),
+                        out,
+                    );
+                }
+                let rest_value = self.temp();
+                out.push_str(&format!(
+                    "  GValue {rest_value} = {matched} ? g_string_drop_prefix({value}, {}) : g_nil();\n",
+                    prefix.len()
+                ));
+                self.gen_pattern(rest, &rest_value, matched, span, out)?;
+                out.push_str(&format!("  g_release({rest_value});\n"));
             }
             Pattern::Constructor(reference, args) => {
-                let info = self.constructor(reference, Span::point(0))?.clone();
+                let info = self.constructor(reference, span)?.clone();
+                pattern_test(
+                    matched,
+                    &format!("g_record_is({value}, {})", c_string(&reference.name)),
+                    out,
+                );
                 let mut position = 0;
                 for arg in args {
-                    match arg {
+                    let (index, pattern) = match arg {
                         PatternArg::Named { label, pattern } => {
-                            let index = info.fields.iter().position(|field| {
-                                field.label.as_ref().or(field.name.as_ref()).map(String::as_str) == Some(label)
-                            }).unwrap();
-                            self.bind_pattern(pattern, &format!("g_record_get({value}, {index})"), out)?;
+                            let index = info
+                                .fields
+                                .iter()
+                                .position(|field| {
+                                    field.label.as_ref().or(field.name.as_ref()) == Some(label)
+                                })
+                                .ok_or_else(|| {
+                                    CodegenError::new(format!("unknown field `{label}`"), span)
+                                })?;
+                            (index, pattern)
                         }
                         PatternArg::Unnamed(pattern) => {
-                            self.bind_pattern(pattern, &format!("g_record_get({value}, {position})"), out)?;
+                            let index = position;
                             position += 1;
+                            (index, pattern)
                         }
-                        PatternArg::DiscardRest => {}
-                    }
+                        PatternArg::DiscardRest => continue,
+                    };
+                    self.gen_pattern(
+                        pattern,
+                        &format!("g_record_get({value}, {index})"),
+                        matched,
+                        span,
+                        out,
+                    )?;
                 }
             }
             Pattern::List { elements, rest } => {
+                let op = if rest.is_some() { ">=" } else { "==" };
+                pattern_test(
+                    matched,
+                    &format!("(({value}).tag == G_NIL || ({value}).tag == G_LIST) && g_list_length({value}) {op} {}", elements.len()),
+                    out,
+                );
                 for (index, element) in elements.iter().enumerate() {
-                    self.bind_pattern(element, &list_item(value, index), out)?;
+                    self.gen_pattern(element, &list_item(value, index), matched, span, out)?;
                 }
                 if let Some(rest) = rest {
-                    self.bind_pattern(rest, &list_tail(value, elements.len()), out)?;
+                    self.gen_pattern(rest, &list_tail(value, elements.len()), matched, span, out)?;
                 }
             }
             Pattern::Tuple(elements) => {
+                pattern_test(
+                    matched,
+                    &format!("({value}).tag == G_TUPLE && ((GTuple *)({value}).as.pointer)->length == {}", elements.len()),
+                    out,
+                );
                 for (index, element) in elements.iter().enumerate() {
-                    self.bind_pattern(element, &format!("g_tuple_get({value}, {index})"), out)?;
+                    self.gen_pattern(
+                        element,
+                        &format!("g_tuple_get({value}, {index})"),
+                        matched,
+                        span,
+                        out,
+                    )?;
                 }
             }
+            Pattern::BitArray(array) => self.gen_bit_pattern(array, value, matched, span, out)?,
             Pattern::Alias { pattern, name } => {
-                self.bind(name, format!("g_retain({value})"), out);
-                self.bind_pattern(pattern, value, out)?;
+                self.gen_pattern(pattern, value, matched, span, out)?;
+                self.bind(
+                    name,
+                    format!("{matched} ? g_retain({value}) : g_nil()"),
+                    out,
+                );
             }
-            Pattern::Alternative(patterns) => {
-                let condition = self.pattern_condition(&patterns[0], value, Span::point(0))?;
-                out.push_str(&format!("  if ({condition}) {{\n"));
-                self.bind_pattern(&patterns[0], value, out)?;
-                for alternative in &patterns[1..] {
-                    out.push_str("  } else {\n");
-                    self.bind_pattern(alternative, value, out)?;
-                }
-                out.push_str("  }\n");
+            Pattern::Alternative(_) => {
+                return Err(CodegenError::new(
+                    "alternative patterns require a case clause",
+                    span,
+                ))
             }
-            _ => {}
         }
         Ok(())
     }
@@ -1504,22 +1623,11 @@ impl<'a> Compiler<'a> {
         self.scopes.last_mut().unwrap().locals.push(variable);
     }
 
-    fn field_index(&self, label: &str, span: Span) -> Result<usize, CodegenError> {
-        let mut found = None;
-        for info in self.constructors.values() {
-            if let Some(index) = info.fields.iter().position(|field| {
-                field.label.as_ref().or(field.name.as_ref()).map(String::as_str) == Some(label)
-            }) {
-                if found.is_some_and(|previous| previous != index) {
-                    return Err(CodegenError::new(format!("ambiguous record field `{label}`"), span));
-                }
-                found = Some(index);
-            }
-        }
-        found.ok_or_else(|| CodegenError::new(format!("unknown record field `{label}`"), span))
-    }
-
-    fn constructor(&self, reference: &ConstructorRef, span: Span) -> Result<&ConstructorInfo, CodegenError> {
+    fn constructor(
+        &self,
+        reference: &ConstructorRef,
+        span: Span,
+    ) -> Result<&ConstructorInfo, CodegenError> {
         self.constructors.get(&reference.name).ok_or_else(|| {
             CodegenError::new(format!("unknown constructor `{}`", reference.name), span)
         })
@@ -1528,6 +1636,10 @@ impl<'a> Compiler<'a> {
     fn gen_record_update(&mut self, update: &RecordUpdate, span: Span, out: &mut String) -> Result<String, CodegenError> {
         let info = self.constructor(&update.constructor, span)?.clone();
         let base = self.gen_expr(&update.base, out)?;
+        out.push_str(&format!(
+            "  if (!g_record_is({base}, {})) g_panic(\"record update has the wrong constructor\", __FILE__, __LINE__);\n",
+            c_string(&update.constructor.name),
+        ));
         let mut replacements = HashMap::new();
         for arg in &update.args {
             let CallArg::Labelled { label, value } = arg else {
@@ -1552,6 +1664,45 @@ impl<'a> Compiler<'a> {
             out.push_str(&format!("  g_release({value});\n"));
         }
         Ok(result)
+    }
+
+    fn gen_use(
+        &mut self,
+        use_: &Use,
+        span: Span,
+        out: &mut String,
+    ) -> Result<String, CodegenError> {
+        let mut args = Vec::with_capacity(use_.patterns.len());
+        let mut statements = Vec::with_capacity(use_.patterns.len() + 1);
+        for (index, pattern) in use_.patterns.iter().enumerate() {
+            let arg = format!("$use_{index}");
+            statements.push(Expression::synthetic(Expr::Let(Let {
+                pattern: pattern.clone(),
+                value: Box::new(Expression::synthetic(Expr::Var(arg.clone()))),
+                annotation: None,
+            })));
+            args.push(arg);
+        }
+        statements.push((*use_.body).clone());
+        let callback = Expression {
+            span,
+            expr: Expr::Fn(FnLiteral {
+                args,
+                annotations: Vec::new(),
+                return_annotation: None,
+                body: Box::new(Expression::synthetic(Expr::Block(statements))),
+            }),
+        };
+        let mut call = match &use_.call.expr {
+            Expr::Call(call) => call.clone(),
+            _ => Call {
+                fun: use_.call.clone(),
+                fun_span: use_.call.span,
+                args: Vec::new(),
+            },
+        };
+        call.args.push(CallArg::Value(callback));
+        self.gen_call(&call, span, out)
     }
 
     fn gen_closure(&mut self, function: &FnLiteral, _out: &mut String) -> Result<String, CodegenError> {
@@ -1603,60 +1754,65 @@ impl<'a> Compiler<'a> {
         ))
     }
 
-    fn gen_capture(&mut self, capture: &Capture, span: Span, out: &mut String) -> Result<String, CodegenError> {
-        let function = self.gen_expr(&capture.fun, out)?;
-        let mut captured_args = Vec::new();
-        let mut placeholders = 0;
-        for arg in &capture.args {
-            match arg {
-                CaptureArg::Value(expression) => {
-                    captured_args.push(Some(self.gen_expr(expression, out)?));
-                }
-                CaptureArg::Placeholder => {
-                    placeholders += 1;
-                    captured_args.push(None);
-                }
-            }
-        }
-        if placeholders != 1 {
-            return Err(CodegenError::new("function captures require one placeholder", span));
-        }
-        let id = self.counter;
-        self.counter += 1;
-        let name = format!("gleam_capture_{id}");
-        let mut definition = format!(
-            "static GValue {name}(GClosure *closure, GValue *args, size_t argc) {{\n  if (argc != 1) g_panic(\"incorrect argument count\", __FILE__, __LINE__);\n  GValue captured[{arity}];\n",
-            arity = captured_args.len()
-        );
-        let mut placeholder = 0;
-        for (index, argument) in captured_args.iter().enumerate() {
-            if argument.is_some() {
-                definition.push_str(&format!("  captured[{index}] = closure->captures[{}];\n", index + 1));
-            } else {
-                definition.push_str(&format!("  captured[{index}] = args[{placeholder}];\n"));
-                placeholder += 1;
-            }
-        }
-        definition.push_str(&format!(
-            "  return g_call(closure->captures[0], captured, {});\n}}\n\n",
-            captured_args.len()
-        ));
-        self.extra_functions.push_str(&definition);
-        let mut captures = vec![function];
-        captures.extend(captured_args.into_iter().flatten());
-        Ok(format!(
-            "g_closure_new({name}, 1, {}, {})",
-            captures.len(),
-            c_arguments(&captures)
-        ))
+    fn gen_capture(
+        &mut self,
+        capture: &Capture,
+        span: Span,
+        out: &mut String,
+    ) -> Result<String, CodegenError> {
+        let name = "$capture".to_string();
+        let parameter = || Expression::synthetic(Expr::Var(name.clone()));
+        let args = capture
+            .args
+            .iter()
+            .map(|arg| match arg {
+                CaptureArg::Value(value) => CallArg::Value(value.clone()),
+                CaptureArg::Labelled { label, value } => CallArg::Labelled {
+                    label: label.clone(),
+                    value: value.clone(),
+                },
+                CaptureArg::Placeholder => CallArg::Value(parameter()),
+                CaptureArg::LabelledPlaceholder(label) => CallArg::Labelled {
+                    label: label.clone(),
+                    value: parameter(),
+                },
+            })
+            .collect();
+        let body = Expression {
+            span,
+            expr: Expr::Call(Call {
+                fun: capture.fun.clone(),
+                args,
+                fun_span: capture.fun.span,
+            }),
+        };
+        self.gen_closure(
+            &FnLiteral {
+                args: vec![name],
+                annotations: Vec::new(),
+                return_annotation: None,
+                body: Box::new(body),
+            },
+            out,
+        )
     }
 
     fn integer(&self, value: &IntValue, span: Span) -> Result<String, CodegenError> {
-        let value = value
-            .as_u64()
-            .filter(|value| *value <= i64::MAX as u64)
-            .ok_or_else(|| CodegenError::new("integer does not fit in a C int64_t", span))?;
-        Ok(format!("INT64_C({value})"))
+        let (negative, magnitude) = match value.raw.strip_prefix('-') {
+            Some(raw) => (true, IntValue { raw: raw.into() }.as_u64()),
+            None => (false, value.as_u64()),
+        };
+        match (negative, magnitude) {
+            (true, Some(n)) if n == 1 << 63 => Ok("INT64_MIN".into()),
+            (_, Some(n)) if n <= i64::MAX as u64 => {
+                let sign = if negative { "-" } else { "" };
+                Ok(format!("({sign}INT64_C({n}))"))
+            }
+            _ => Err(CodegenError::new(
+                "integer does not fit in a C int64_t",
+                span,
+            )),
+        }
     }
 
     fn float(&self, value: &FloatValue) -> String {
@@ -1985,6 +2141,53 @@ fn c_arguments(values: &[String]) -> String {
     } else {
         format!("(GValue[]){{{}}}", values.join(", "))
     }
+}
+
+fn order_arguments(
+    evaluated: Vec<(Option<String>, String)>,
+    labels: &[Option<String>],
+    span: Span,
+) -> Result<Vec<String>, CodegenError> {
+    let mut ordered = vec![None; evaluated.len()];
+    let mut position = 0;
+    for (label, value) in evaluated {
+        let index = if let Some(label) = label {
+            labels
+                .iter()
+                .position(|candidate| candidate.as_ref() == Some(&label))
+        } else {
+            while position < ordered.len() && ordered[position].is_some() {
+                position += 1;
+            }
+            (position < ordered.len()).then_some(position)
+        };
+        let Some(index) = index.filter(|index| *index < ordered.len()) else {
+            return Err(CodegenError::new(
+                "unknown or misplaced call argument",
+                span,
+            ));
+        };
+        if ordered[index].replace(value).is_some() {
+            return Err(CodegenError::new("duplicate call argument", span));
+        }
+    }
+    Ok(ordered.into_iter().map(Option::unwrap).collect())
+}
+
+fn pattern_test(matched: &str, condition: &str, out: &mut String) {
+    out.push_str(&format!("  if ({matched}) {matched} = ({condition});\n"));
+}
+
+fn is_c_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn c_string_value(value: &str) -> String {
+    format!("g_string_n({}, {})", c_string(value), value.len())
 }
 
 fn c_string(value: &str) -> String {
