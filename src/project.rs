@@ -3,7 +3,7 @@ use crate::codegen::{
     generate_c, generate_c_standalone, is_stdlib_module, write_generated_project,
 };
 use crate::{parse, typecheck};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,8 +28,23 @@ impl fmt::Display for SourceError {
 
 impl std::error::Error for SourceError {}
 
-/// Load the entry file and its imports from the project's source tree.
+/// Generated C and the native source files that must be linked with it.
+#[derive(Debug)]
+pub struct CTranslation {
+    pub source: String,
+    pub native_sources: Vec<PathBuf>,
+}
+
+/// Load the entry file and its imports and return the generated C.
 pub fn translate_file(entry: impl AsRef<Path>, standalone: bool) -> Result<String, SourceError> {
+    translate_file_with_externals(entry, standalone).map(|translation| translation.source)
+}
+
+/// Load the entry file and its imports, and resolve C externals in the source tree.
+pub fn translate_file_with_externals(
+    entry: impl AsRef<Path>,
+    standalone: bool,
+) -> Result<CTranslation, SourceError> {
     let entry = entry.as_ref();
     let path = entry.canonicalize().map_err(|error| SourceError {
         path: entry.to_owned(),
@@ -60,7 +75,12 @@ pub fn translate_file(entry: impl AsRef<Path>, standalone: bool) -> Result<Strin
     } else {
         generate_c
     };
-    generate(&module).map_err(|error| project.error(error.span, error.message))
+    let source = generate(&module).map_err(|error| project.error(error.span, error.message))?;
+    let native_sources = project.native_sources(&module)?;
+    Ok(CTranslation {
+        source,
+        native_sources,
+    })
 }
 
 /// Compile a source tree and write a C translation unit and its runtime.
@@ -68,13 +88,22 @@ pub fn write_c_project_file(
     entry: impl AsRef<Path>,
     directory: impl AsRef<Path>,
 ) -> Result<(), SourceError> {
-    let c_source = translate_file(entry, false)?;
+    write_c_project_file_with_externals(entry, directory).map(|_| ())
+}
+
+/// Write the generated C and runtime and return the additional C files to link.
+pub fn write_c_project_file_with_externals(
+    entry: impl AsRef<Path>,
+    directory: impl AsRef<Path>,
+) -> Result<Vec<PathBuf>, SourceError> {
+    let translation = translate_file_with_externals(entry, false)?;
     let directory = directory.as_ref();
-    write_generated_project(&c_source, directory).map_err(|error| SourceError {
+    write_generated_project(&translation.source, directory).map_err(|error| SourceError {
         path: directory.into(),
         location: None,
         message: error.to_string(),
-    })
+    })?;
+    Ok(translation.native_sources)
 }
 
 struct Source {
@@ -167,19 +196,58 @@ impl Names {
 }
 
 impl Project<'_> {
-    fn error(&self, span: Span, message: String) -> SourceError {
-        let file = self
-            .files
+    fn source_at(&self, span: Span) -> &Source {
+        self.files
             .iter()
             .rev()
             .find(|file| file.start <= span.start)
-            .expect("at least one source has been loaded");
+            .expect("at least one source has been loaded")
+    }
+
+    fn error(&self, span: Span, message: String) -> SourceError {
+        let file = self.source_at(span);
         let start = span.start.saturating_sub(file.start).min(file.text.len());
         SourceError {
             path: file.path.clone(),
             location: Some(Span::point(start).line_col(&file.text)),
             message,
         }
+    }
+
+    fn native_sources(&self, module: &Module) -> Result<Vec<PathBuf>, SourceError> {
+        let mut paths = BTreeSet::new();
+        for definition in &module.definitions {
+            let Definition::Fn(function) = definition else {
+                continue;
+            };
+            let Some(external) = function.c_externals().next() else {
+                continue;
+            };
+            let native = Path::new(&external.module);
+            if !native.extension().is_some_and(|extension| extension == "c") {
+                continue;
+            }
+            let source = self.source_at(function.span);
+            let directory = source.path.parent().expect("absolute source file path");
+            let native = directory.join(native);
+            let path = native.canonicalize().map_err(|error| {
+                self.error(
+                    function.span,
+                    format!(
+                        "cannot load C external source `{}`: {error}",
+                        native.display()
+                    ),
+                )
+            })?;
+            if !path.is_file() {
+                return Err(self.error(
+                    function.span,
+                    format!("C external source `{}` is not a file", native.display()),
+                ));
+            }
+            paths.insert(path);
+        }
+        Ok(paths.into_iter().collect())
     }
 
     fn load(&mut self, path: &Path, entry: bool) -> Result<(), SourceError> {

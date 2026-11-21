@@ -165,6 +165,15 @@ pub struct FnDef {
     pub span: Span,
 }
 
+impl FnDef {
+    pub(crate) fn c_externals(&self) -> impl Iterator<Item = &ExternalFn> {
+        self.attributes.iter().filter_map(|attribute| match attribute {
+            Attribute::External(external) if external.lang == "c" => Some(external),
+            _ => None,
+        })
+    }
+}
+
 /// A function argument: an optional external label and the internal name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnArg {

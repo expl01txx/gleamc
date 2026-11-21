@@ -547,3 +547,73 @@ fn incomplete_use_panics_when_its_callback_is_called() {
     assert_eq!(run.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&run.stderr).ends_with(": todo\n"));
 }
+
+#[test]
+fn cli_links_external_c_from_an_imported_module() {
+    if !cc_available() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("gleamc-ffi-test-{}", std::process::id()));
+    let src = root.join("src/nested/in a directory");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        root.join("src/main.gleam"),
+        "import nested/bindings\npub fn main() { bindings.run() }",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/nested/bindings.gleam"),
+        include_str!("../examples/ffi.gleam")
+            .replace("pub fn main()", "pub fn run()")
+            .replace("ffi_native.c", "in a directory/ffi_native.c"),
+    )
+    .unwrap();
+    let native = src.join("ffi_native.c");
+    std::fs::write(&native, include_str!("../examples/ffi_native.c")).unwrap();
+
+    let input = root.join("src/main.gleam");
+    let translation = gleamc::translate_file_with_externals(input, false).unwrap();
+    assert_eq!(translation.native_sources, [native.canonicalize().unwrap()]);
+
+    let gleamc = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_gleamc"))
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let run = |path| {
+        let result = Command::new(root.join(path)).output().unwrap();
+        assert!(result.status.success(), "{:?}", result);
+        assert_eq!(result.stdout, b"C FFI works\n");
+    };
+    let result = gleamc(&["src/main.gleam", "-release"]);
+    assert!(result.status.success(), "{:?}", result);
+    run("program");
+
+    let result = gleamc(&["src/main.gleam", "-c", "-o", "generated C"]);
+    assert!(result.status.success(), "{:?}", result);
+    let result = Command::new("cc")
+        .current_dir(&root)
+        .args([
+            "-std=c11",
+            "-pedantic",
+            "-I",
+            "generated C",
+            "generated C/main.c",
+        ])
+        .arg(&native)
+        .args(["-o", "generated C/program"])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{:?}", result);
+    run("generated C/program");
+
+    std::fs::remove_file(&native).unwrap();
+    let result = gleamc(&["src/main.gleam"]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("src/nested/bindings.gleam:"), "{stderr}");
+    assert!(stderr.contains("cannot load C external source"), "{stderr}");
+    std::fs::remove_dir_all(root).unwrap();
+}

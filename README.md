@@ -1,6 +1,6 @@
 # gleamc
 
-A [Gleam](https://gleam.run/) → C compiler written in Rust. It loads a `.gleam` entry file and its local imports, translates them to C11 against an embedded C runtime, and compiles the result into a native binary with `cc`. With `-c` it instead emits a single self-contained C file you can compile yourself.
+A [Gleam](https://gleam.run/) → C compiler written in Rust. It loads a `.gleam` entry file and its local imports, translates them to C11 against an embedded C runtime, and compiles the result into a native binary with `cc`. With `-c` it emits C with the Gleam runtime embedded so you can compile it yourself.
 
 No external crates — the whole project is `std`-only Rust plus two hand-written C files.
 
@@ -32,7 +32,7 @@ Pass `-release` to build an optimized binary (`-O3 -flto -ffunction-sections -fd
 ./target/debug/gleamc tests/hello.gleam -release
 ```
 
-To emit C instead of a binary, pass `-c`: this writes a single self-contained C file (runtime embedded) that compiles with one command:
+Use `-c` to emit C with the runtime embedded. Programs that only use Gleam and built-in runtime modules build from the resulting file directly.
 
 ```sh
 ./target/debug/gleamc tests/hello.gleam -c
@@ -65,6 +65,7 @@ end-to-end test in `tests/runtime.rs`:
 | `examples/int.gleam` | the `gleam/int` module (conversions, parity, clamping, bases, digits) |
 | `examples/string.gleam` | the `gleam/string` module (case changes, trimming, splitting, slicing, predicates) |
 | `examples/list.gleam` | the `gleam/list` module (map/filter/fold, zip, sort, chunking) |
+| `examples/ffi.gleam` | calling C through wrappers that use Gleam values |
 
 Run one:
 
@@ -107,7 +108,61 @@ These modules work without an explicit import.
 
 The C target currently uses signed 64-bit integers, a subset of the standard library, and its own C foreign-function interface. Dependency resolution covers local source files and the built-in runtime modules. Hex package resolution remains outside the current build workflow. Pattern exhaustiveness and variants narrowed by earlier matches still differ from upstream. Generated programs can panic on a case that has no matching clause.
 
-A Gleam function with foreign attributes can supply a Gleam body for the C target. `@external(c, "module", "symbol")` selects a function with the signature `GValue symbol(GValue *, size_t)`. The symbol must be supplied by the runtime or linked as part of the C build.
+## Calling C from Gleam
+
+Declare a typed Gleam function using `@external(c, "./source.c", "wrapper")`.
+The compiler resolves the `.c` path relative to the Gleam file that declares
+it, including declarations in imported modules. A normal CLI build compiles
+and links each referenced C file once.
+
+```gleam
+@external(c, "./ffi_native.c", "example_clamp_byte")
+fn clamp_byte(value: Int) -> Int
+```
+
+```c
+#include "gleam_runtime.h"
+
+static int64_t clamp_byte(int64_t value) {
+  if (value < 0) return 0;
+  if (value > 255) return 255;
+  return value;
+}
+
+GValue example_clamp_byte(GValue *args, size_t argc) {
+  (void)argc;
+  return g_int(clamp_byte(args[0].as.integer));
+}
+```
+
+The compiler passes arguments in declaration order and checks the arity
+before calling the wrapper. The wrapper borrows the argument array and its
+values for the duration of the call. Return a new value using runtime
+constructors such as `g_int`, `g_bool`, or `g_string`. Use `g_retain` to
+return a borrowed heap value or to keep it after the call, then release any
+retained values you store with `g_release` when they are no longer needed.
+The Gleam annotations check calls from Gleam. Your wrapper is responsible for
+returning the declared type.
+
+```sh
+./target/debug/gleamc examples/ffi.gleam
+./program
+```
+
+With `-c`, the compiler writes the generated C and the runtime header, then
+prints a command that links the original C files. You can add linker flags
+for libraries used by your wrappers.
+
+```sh
+./target/debug/gleamc examples/ffi.gleam -c
+cc -std=c11 -I gleam-out gleam-out/ffi.c examples/ffi_native.c -o program
+```
+
+Use `translate_file_with_externals` or `write_c_project_file_with_externals`
+to get the native source paths from Rust. A module name without a `.c` suffix
+continues to refer to a symbol supplied by the runtime or a manual C link.
+When a declaration includes a Gleam fallback, the C target uses its C
+external.
 
 ## Repository layout
 

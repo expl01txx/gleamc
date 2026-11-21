@@ -1,7 +1,8 @@
-use gleamc::{translate_file, write_c_project_file};
+use gleamc::codegen::RUNTIME_HEADER;
+use gleamc::{translate_file_with_externals, write_c_project_file_with_externals, CTranslation};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -14,7 +15,7 @@ after a successful compile.
 
 options:
   -o <dir>   staging/output directory (default: gleam-out)
-  -c         write a single self-contained C file and skip compilation
+  -c         emit C without compiling (foreign sources are linked separately)
   -release   compile with optimizations (-O3, LTO, section garbage collection)
 ";
 
@@ -50,27 +51,13 @@ fn main() -> ExitCode {
     }
 
     if codegen_only {
-        // Emit one self-contained C file that can be compiled manually.
-        let stem = Path::new(&input)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("main");
-        let c_path = output.join(format!("{stem}.c"));
-        let result = translate_file(&input, true)
+        let result = translate_file_with_externals(&input, true)
             .map_err(|error| error.to_string())
-            .and_then(|c_source| {
-                fs::create_dir_all(&output).map_err(|error| error.to_string())?;
-                fs::write(&c_path, c_source).map_err(|error| error.to_string())
+            .and_then(|translation| {
+                emit_c(Path::new(&input), &output, &translation).map_err(|error| error.to_string())
             });
         return match result {
-            Ok(()) => {
-                println!(
-                    "wrote {} (compile with: cc -std=c11 {} -o program)",
-                    c_path.display(),
-                    c_path.display()
-                );
-                ExitCode::SUCCESS
-            }
+            Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
                 ExitCode::FAILURE
@@ -87,32 +74,24 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = write_c_project_file(&input, &output) {
-        let _ = fs::remove_dir(&output);
-        eprintln!("{error}");
-        return ExitCode::FAILURE;
-    }
+    let native_sources = match write_c_project_file_with_externals(&input, &output) {
+        Ok(sources) => sources,
+        Err(error) => {
+            let _ = fs::remove_dir(&output);
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let mut cc_args: Vec<&str> = vec!["-std=c11", "-Wall", "-Wextra"];
-    if release {
-        cc_args.extend([
-            "-O3",
-            "-flto",
-            "-ffunction-sections",
-            "-fdata-sections",
-            "-Wl,--gc-sections",
-            "-DNDEBUG",
-        ]);
-    }
-
-    let binary = PathBuf::from("program");
-    let compile = Command::new("cc")
-        .args(&cc_args)
+    let binary = Path::new("program");
+    let mut command = c_compiler(&output, release);
+    command
         .arg(output.join("main.c"))
         .arg(output.join("gleam_runtime.c"))
+        .args(&native_sources)
         .arg("-o")
-        .arg(&binary)
-        .output();
+        .arg(binary);
+    let compile = command.output();
 
     match compile {
         Ok(result) if result.status.success() => {
@@ -141,10 +120,9 @@ fn main() -> ExitCode {
                 String::from_utf8_lossy(&result.stderr)
             );
             eprintln!(
-                "C files kept in {} (compile with: cc -std=c11 {}/main.c {}/gleam_runtime.c -o program)",
+                "C files kept in {} (compile with: {})",
                 output.display(),
-                output.display(),
-                output.display()
+                display_command(&command)
             );
             ExitCode::FAILURE
         }
@@ -154,6 +132,103 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn emit_c(input: &Path, output: &Path, translation: &CTranslation) -> io::Result<()> {
+    let stem = input
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("main");
+    let c_path = output.join(format!("{stem}.c"));
+    if c_path
+        .canonicalize()
+        .is_ok_and(|path| translation.native_sources.contains(&path))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "generated C would overwrite external source `{}`",
+                c_path.display()
+            ),
+        ));
+    }
+    fs::create_dir_all(output)?;
+    if !translation.native_sources.is_empty() {
+        write_runtime_header(&output.join("gleam_runtime.h"))?;
+    }
+    fs::write(&c_path, &translation.source)?;
+
+    let mut command = c_compiler(output, false);
+    command
+        .arg(&c_path)
+        .args(&translation.native_sources)
+        .args(["-o", "program"]);
+    println!(
+        "wrote {} (compile with: {})",
+        c_path.display(),
+        display_command(&command)
+    );
+    Ok(())
+}
+
+fn write_runtime_header(path: &Path) -> io::Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file.write_all(RUNTIME_HEADER.as_bytes()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if fs::read(path)? == RUNTIME_HEADER.as_bytes() {
+                return Ok(());
+            }
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "output header `{}` already exists with different contents",
+                    path.display()
+                ),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn c_compiler(include_dir: &Path, release: bool) -> Command {
+    let mut command = Command::new("cc");
+    command
+        .args(["-std=c11", "-Wall", "-Wextra", "-x", "c", "-I"])
+        .arg(include_dir);
+    if release {
+        command.args([
+            "-O3",
+            "-flto",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wl,--gc-sections",
+            "-DNDEBUG",
+        ]);
+    }
+    command
+}
+
+fn display_command(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|arg| {
+            let arg = arg.to_string_lossy();
+            if !arg.is_empty()
+                && arg
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_./=,".contains(&byte))
+            {
+                arg.into_owned()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn staging_directory(output: &Path) -> io::Result<PathBuf> {

@@ -46,7 +46,10 @@ pub use codegen::{
 };
 pub use lexer::{lex, Token, TokenKind};
 pub use parser::parse_module;
-pub use project::{translate_file, write_c_project_file, SourceError};
+pub use project::{
+    translate_file, translate_file_with_externals, write_c_project_file,
+    write_c_project_file_with_externals, CTranslation, SourceError,
+};
 pub use typechecker::{typecheck, typecheck_source, TypeCheckError};
 
 /// Parse a Gleam source file into an AST.

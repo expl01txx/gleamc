@@ -422,14 +422,7 @@ impl<'a> Compiler<'a> {
         self.scopes.clear();
         self.scopes.push(Scope::default());
 
-        if let Some(external) = function
-            .attributes
-            .iter()
-            .find_map(|attribute| match attribute {
-                Attribute::External(external) if external.lang == "c" => Some(external),
-                _ => None,
-            })
-        {
+        if let Some(external) = function.c_externals().next() {
             if !is_c_identifier(&external.function) {
                 return Err(CodegenError::new(
                     "invalid C external function name",

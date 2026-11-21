@@ -1316,6 +1316,22 @@ impl<'a> Checker<'a> {
         if self.env.functions.contains_key(&f.name) || self.env.constants.contains_key(&f.name) {
             return Err(self.error(format!("duplicate function `{}`", f.name), f.span));
         }
+        let mut externals = f.c_externals();
+        if externals.next().is_some() {
+            if externals.next().is_some() {
+                return Err(self.error("a function can only have one C external", f.span));
+            }
+            if !f.return_annotation.as_ref().is_some_and(complete_annotation)
+                || f.args.iter().any(|arg| {
+                    !arg.type_annotation.as_ref().is_some_and(complete_annotation)
+                })
+            {
+                return Err(self.error(
+                    "C externals require explicit argument and return type annotations",
+                    f.span,
+                ));
+            }
+        }
         let mut param_env = HashMap::new();
         // Lowercase names in annotations are type variables; give each name
         // one fresh variable for the whole signature.
@@ -2709,6 +2725,19 @@ fn fn_ret(ty: &Type) -> Type {
 }
 
 /// Collect the lowercase (type variable) names in a type annotation.
+fn complete_annotation(annotation: &TypeAnnotation) -> bool {
+    match annotation {
+        TypeAnnotation::Hole => false,
+        TypeAnnotation::Named { args, .. } | TypeAnnotation::Tuple(args) => {
+            args.iter().all(complete_annotation)
+        }
+        TypeAnnotation::Fn { args, ret } => {
+            args.iter().all(complete_annotation) && complete_annotation(ret)
+        }
+        TypeAnnotation::BitArray { .. } => true,
+    }
+}
+
 fn collect_annotation_names(annotation: &TypeAnnotation, out: &mut Vec<String>) {
     match annotation {
         TypeAnnotation::Named { module, name, args } => {

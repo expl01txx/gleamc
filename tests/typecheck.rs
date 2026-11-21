@@ -582,3 +582,27 @@ fn panic_and_assert_messages_must_be_strings() {
     err("pub fn main() { panic as 123 }", "type mismatch");
     err("pub fn main() { assert True as { 123 } }", "type mismatch");
 }
+
+#[test]
+fn c_external_requires_a_complete_signature() {
+    err(
+        r#"@external(c, "native.c", "wrapper") fn extern_fn(x) -> Int"#,
+        "require explicit argument and return type annotations",
+    );
+    err(
+        r#"@external(c, "native.c", "wrapper") fn extern_fn(x: List(_)) -> Int"#,
+        "require explicit argument and return type annotations",
+    );
+    err(
+        r#"@external(c, "native.c", "wrapper") fn extern_fn(x: Int)"#,
+        "require explicit argument and return type annotations",
+    );
+    err(
+        r#"
+        @external(c, "first.c", "first")
+        @external(c, "second.c", "second")
+        fn extern_fn() -> Int
+        "#,
+        "can only have one C external",
+    );
+}
