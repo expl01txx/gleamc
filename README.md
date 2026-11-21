@@ -66,6 +66,7 @@ end-to-end test in `tests/runtime.rs`:
 | `examples/string.gleam` | the `gleam/string` module (case changes, trimming, splitting, slicing, predicates) |
 | `examples/list.gleam` | the `gleam/list` module (map/filter/fold, zip, sort, chunking) |
 | `examples/ffi.gleam` | calling C through wrappers that use Gleam values |
+| `examples/raylib/` | a Raylib window drawing a rectangle through C FFI |
 
 Run one:
 
